@@ -1,0 +1,10 @@
+node_modules/
+.pnpm-store/
+dist/
+.svelte-kit/
+build/
+.env
+*.log
+coverage/
+.DS_Store
+Thumbs.db

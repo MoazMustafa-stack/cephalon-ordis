@@ -1,0 +1,10 @@
+{
+  "name": "Cephalon Ordis",
+  "short_name": "Ordis",
+  "description": "Local-first Codex operations console",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#071016",
+  "theme_color": "#111827",
+  "icons": [{ "src": "/ordis.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}

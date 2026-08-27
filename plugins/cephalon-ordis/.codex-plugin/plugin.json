@@ -1,0 +1,19 @@
+{
+  "name": "cephalon-ordis",
+  "version": "0.1.0",
+  "description": "Local-first operations, reporting, and idea-validation workflows for Cephalon Ordis",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Cephalon Ordis",
+    "shortDescription": "Operate your local Ordis command center.",
+    "longDescription": "Adds evidence-backed reporting, briefs, reviews, idea mapping and validation, update preparation, and a local Ordis MCP connection.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": ["Local operations", "Evidence-backed reporting", "Idea validation"],
+    "defaultPrompt": "Show my Cephalon Ordis status and help me choose the next evidence-backed action."
+  },
+  "mcpServers": "./.mcp.json"
+}

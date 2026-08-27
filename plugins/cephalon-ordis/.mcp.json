@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "ordis": {
+      "command": "node",
+      "args": ["../../../packages/ordis-mcp/dist/index.js"],
+      "env": {
+        "ORDIS_COORDINATOR_URL": "http://127.0.0.1:4310"
+      }
+    }
+  }
+}

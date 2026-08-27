@@ -1,0 +1,15 @@
+name: cephalon-ordis
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ordis
+      POSTGRES_USER: ordis
+      POSTGRES_PASSWORD: ${ORDIS_POSTGRES_PASSWORD:?set ORDIS_POSTGRES_PASSWORD}
+    volumes:
+      - /srv/cephalon-ordis/data/postgres:/var/lib/postgresql/data
+      - /srv/cephalon-ordis/code/db/migrations:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+

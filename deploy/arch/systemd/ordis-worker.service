@@ -1,0 +1,18 @@
+[Unit]
+Description=Cephalon Ordis local Codex worker
+After=ordis-coordinator.service
+
+[Service]
+User=ordis
+Group=ordis
+WorkingDirectory=/srv/cephalon-ordis/code
+EnvironmentFile=/srv/cephalon-ordis/config/ordis.env
+ExecStart=/usr/bin/pnpm --filter @ordis/worker start
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/srv/cephalon-ordis/data/worktrees /srv/cephalon-ordis/data/artifacts /srv/cephalon-ordis/data/logs
+
+[Install]
+WantedBy=multi-user.target
+

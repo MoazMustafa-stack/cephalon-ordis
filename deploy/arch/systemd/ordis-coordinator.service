@@ -1,0 +1,19 @@
+[Unit]
+Description=Cephalon Ordis coordinator
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+User=ordis
+Group=ordis
+WorkingDirectory=/srv/cephalon-ordis/code
+EnvironmentFile=/srv/cephalon-ordis/config/ordis.env
+ExecStart=/usr/bin/pnpm --filter @ordis/coordinator start
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/srv/cephalon-ordis/data
+
+[Install]
+WantedBy=multi-user.target
+
