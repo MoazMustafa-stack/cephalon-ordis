@@ -28,11 +28,16 @@ The Git root is `E:\Cephalon-Ordis\code`. Runtime state is deliberately outside 
 
 ## Development
 
-1. Copy `.env.example` to `.env`, choose a PostgreSQL password, and set `ORDIS_SESSION_TOKEN`.
+1. Copy `.env.example` to `.env`, replace all placeholders, and keep the file private.
 2. Run `pnpm install`.
-3. Start PostgreSQL with `docker compose up -d postgres`.
-4. Start coordinator and PWA with `pnpm dev`.
-5. Authenticate Codex locally using its normal ChatGPT sign-in, then start `pnpm --filter @ordis/worker dev`.
+3. Start Docker Desktop.
+4. Launch the complete Windows development stack:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start-dev.ps1
+```
+
+The launcher starts PostgreSQL and opens coordinator, worker, and web in separate windows. Each child resolves Node explicitly and loads `.env`, so stale terminal PATH and process-level environment variables are not required.
 
 Use `ORDIS_AUTH_MODE=development` only on loopback during development. Private deployments use a passkey-authenticated reverse proxy/session issuer and Tailscale ACLs; the coordinator validates the resulting bearer session at its boundary.
 
@@ -47,4 +52,3 @@ pnpm audit:subscription-only
 ```
 
 See [architecture](docs/architecture.md), [security](docs/security.md), and [operations](docs/operations.md).
-
