@@ -30,7 +30,5 @@ async function heartbeat() {
 }
 
 await heartbeat();
-setInterval(() => heartbeat().catch((error) => console.error(error)), 15_000).unref();
+setInterval(() => heartbeat().catch((error) => console.error(error)), 15_000);
 console.log(`Ordis worker ${nodeId} online; local Codex CLI execution only`);
-await new Promise(() => undefined);
-
