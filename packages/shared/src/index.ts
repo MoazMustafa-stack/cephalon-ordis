@@ -2,6 +2,16 @@ import { z } from "zod";
 
 export const Id = z.string().uuid();
 export const IsoDate = z.string().datetime();
+export const ProjectRegistration = z.object({
+  name: z.string().trim().min(1).max(120),
+  repositoryPath: z.string().trim().min(1)
+});
+export const Project = z.object({
+  id: Id,
+  name: z.string().min(1),
+  repositoryPath: z.string().min(1),
+  createdAt: IsoDate
+});
 export const RunState = z.enum([
   "queued", "waiting_for_allowance", "claimed", "running", "awaiting_approval",
   "succeeded", "failed", "cancelled"
@@ -108,4 +118,5 @@ export type Report = z.infer<typeof Report>;
 export type IdeaGraph = z.infer<typeof IdeaGraph>;
 export type PortfolioTransaction = z.infer<typeof PortfolioTransaction>;
 export type CostGuardState = z.infer<typeof CostGuardState>;
-
+export type ProjectRegistration = z.infer<typeof ProjectRegistration>;
+export type Project = z.infer<typeof Project>;

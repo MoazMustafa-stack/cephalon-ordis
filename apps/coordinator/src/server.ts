@@ -1,7 +1,7 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import websocket from "@fastify/websocket";
-import { NodeHeartbeat } from "@ordis/shared";
+import { NodeHeartbeat, ProjectRegistration } from "@ordis/shared";
 import { initialRunState, readCostGuard } from "./cost-guard.js";
 import type { OrdisStore } from "./store.js";
 
@@ -32,6 +32,25 @@ export function buildServer(store: OrdisStore, env: NodeJS.ProcessEnv = process.
   for (const [route, table] of Object.entries(tableRoutes)) {
     app.get(route, async () => ({ items: await store.list(table) }));
   }
+  app.post<{ Body: unknown }>("/api/projects", async (request, reply) => {
+    const parsed = ProjectRegistration.safeParse(request.body);
+
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: "invalid_project",
+        issues: parsed.error.issues
+      });
+    }
+
+    const result = await store.registerProject(
+      parsed.data.name,
+      parsed.data.repositoryPath
+    );
+
+    return reply
+      .code(result.created ? 201 : 200)
+      .send(result.project);
+  });
   app.get("/api/artifacts", async () => ({ items: [], root: env.ORDIS_DATA_ROOT ? `${env.ORDIS_DATA_ROOT}\\artifacts` : null }));
   app.get("/api/portfolio/developer", async () => ({ mode: "read-only", items: [] }));
   app.get("/api/portfolio/investments", async () => ({ mode: "read-only", items: await store.list("portfolio_transactions") }));

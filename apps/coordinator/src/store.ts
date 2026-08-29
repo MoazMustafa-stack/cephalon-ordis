@@ -1,14 +1,20 @@
 import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
-import type { NodeHeartbeat, Run, RunEvent } from "@ordis/shared";
+import type { NodeHeartbeat, Project, Run, RunEvent } from "@ordis/shared";
 
 export type JsonRecord = Record<string, unknown>;
+export type ProjectRegistrationResult = {
+  project: Project;
+  created: boolean;
+};
+
 export interface OrdisStore {
   list(table: "projects" | "nodes" | "runs" | "approval_requests" | "reports" | "idea_graphs" | "portfolio_transactions"): Promise<unknown[]>;
   createRun(projectId: string, state: Run["state"], payload: JsonRecord): Promise<Run>;
   appendEvent(runId: string, type: string, payload?: JsonRecord): Promise<RunEvent>;
   heartbeat(heartbeat: NodeHeartbeat): Promise<void>;
   consumeApproval(id: string): Promise<boolean>;
+  registerProject(name: string, repositoryPath: string): Promise<ProjectRegistrationResult>;
   close(): Promise<void>;
 }
 
@@ -54,6 +60,35 @@ export class PgStore implements OrdisStore {
     );
     return result.rowCount === 1;
   }
+  async registerProject(name: string, repositoryPath: string): Promise<ProjectRegistrationResult> {
+    const result = await this.pool.query(
+      `WITH inserted AS (
+        INSERT INTO projects(name, repository_path)
+        VALUES ($1, $2)
+        ON CONFLICT(repository_path) DO NOTHING
+        RETURNING id, name, repository_path, created_at, true AS created
+      )
+      SELECT * FROM inserted
+      UNION ALL
+      SELECT id, name, repository_path, created_at, false AS created
+      FROM projects
+      WHERE repository_path = $2
+      LIMIT 1`,
+      [name, repositoryPath]
+    );
+
+    const row = camel(result.rows[0]) as Project & { created: boolean };
+
+    return {
+      project: {
+        id: row.id,
+        name: row.name,
+        repositoryPath: row.repositoryPath,
+        createdAt: row.createdAt
+      },
+      created: row.created
+    };
+  }
   async close() { await this.pool.end(); }
 }
 
@@ -61,7 +96,10 @@ export class MemoryStore implements OrdisStore {
   private runs: Run[] = [];
   private events: RunEvent[] = [];
   private nodes: NodeHeartbeat[] = [];
+  private projects: Project[] = [];
+
   async list(table: Parameters<OrdisStore["list"]>[0]) {
+    if (table === "projects") return this.projects;
     if (table === "runs") return this.runs;
     if (table === "nodes") return this.nodes;
     return [];
@@ -79,5 +117,24 @@ export class MemoryStore implements OrdisStore {
   }
   async heartbeat(h: NodeHeartbeat) { this.nodes = [h, ...this.nodes.filter((n) => n.nodeId !== h.nodeId)]; }
   async consumeApproval() { return false; }
+  async registerProject(name: string, repositoryPath: string): Promise<ProjectRegistrationResult> {
+    const existing = this.projects.find(
+      (project) => project.repositoryPath === repositoryPath
+    );
+
+    if (existing) {
+      return { project: existing, created: false };
+    }
+
+    const project: Project = {
+      id: randomUUID(),
+      name,
+      repositoryPath,
+      createdAt: new Date().toISOString()
+    };
+
+    this.projects.unshift(project);
+    return { project, created: true };
+  }
   async close() {}
 }

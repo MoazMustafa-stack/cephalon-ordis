@@ -44,4 +44,63 @@ describe("coordinator", () => {
     const response = await app.inject({ method: "GET", url: "/api/system/allowance" });
     expect(response.statusCode).toBe(500);
   });
+
+  it("registers a project idempotently", async () => {
+    const app = buildServer(new MemoryStore(), {
+      NODE_ENV: "test",
+      ORDIS_AUTH_MODE: "development"
+    });
+    apps.push(app);
+
+    const payload = {
+      name: "Cephalon Ordis",
+      repositoryPath: "E:\\Cephalon-Ordis\\code"
+    };
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/projects",
+      payload
+    });
+
+    expect(created.statusCode).toBe(201);
+    expect(created.json()).toMatchObject(payload);
+
+    const repeated = await app.inject({
+      method: "POST",
+      url: "/api/projects",
+      payload
+    });
+
+    expect(repeated.statusCode).toBe(200);
+    expect(repeated.json().id).toBe(created.json().id);
+
+    const projects = await app.inject({
+      method: "GET",
+      url: "/api/projects"
+    });
+
+    expect(projects.statusCode).toBe(200);
+    expect(projects.json().items).toHaveLength(1);
+  });
+
+  it("rejects an invalid project registration", async () => {
+    const app = buildServer(new MemoryStore(), {
+      NODE_ENV: "test",
+      ORDIS_AUTH_MODE: "development"
+    });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/projects",
+      payload: {
+        name: "",
+        repositoryPath: ""
+      }
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error).toBe("invalid_project");
+  });
 });
