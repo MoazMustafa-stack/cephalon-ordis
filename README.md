@@ -37,11 +37,24 @@ The Git root is `E:\Cephalon-Ordis\code`. Runtime state is deliberately outside 
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start-dev.ps1
 ```
 
-The launcher starts PostgreSQL and opens coordinator, worker, and web in separate windows. Each child resolves Node explicitly and loads `.env`, so stale terminal PATH and process-level environment variables are not required.
+The launcher waits for PostgreSQL health, opens the coordinator, waits for its
+`/health` response, and then opens worker and web in separate windows. Each
+child resolves Node explicitly and loads `.env`, so stale terminal PATH and
+process-level environment variables are not required. The worker also retries a
+temporarily unavailable coordinator instead of exiting.
 
 Use `ORDIS_AUTH_MODE=development` only on loopback during development. Private deployments use a passkey-authenticated reverse proxy/session issuer and Tailscale ACLs; the coordinator validates the resulting bearer session at its boundary.
 
 ## Verification
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify.ps1
+```
+
+The Windows verification runner resolves Node and pnpm explicitly, so it is the
+supported path even when a terminal inherited a stale or malformed PATH.
+
+The equivalent individual package commands are:
 
 ```powershell
 pnpm test

@@ -4,6 +4,7 @@ dist/
 .svelte-kit/
 build/
 .env
+AGENTS.md
 *.log
 coverage/
 .DS_Store

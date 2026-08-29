@@ -8,6 +8,8 @@ const coordinator = process.env.ORDIS_COORDINATOR_URL ?? "http://127.0.0.1:4310"
 const nodeId = process.env.ORDIS_NODE_ID ?? randomUUID();
 const token = process.env.ORDIS_SESSION_TOKEN;
 const headers = { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) };
+const startupRetryBaseMs = 1_000;
+const startupRetryMaxMs = 15_000;
 
 export function runCodexInWorktree(prompt: string, worktree: string) {
   return spawn("codex", ["exec", "--json", "--cd", worktree, prompt], {
@@ -29,6 +31,22 @@ async function heartbeat() {
   if (!response.ok) throw new Error(`heartbeat failed: ${response.status}`);
 }
 
-await heartbeat();
+async function waitForCoordinator() {
+  let attempts = 0;
+  for (;;) {
+    try {
+      await heartbeat();
+      return;
+    } catch (error) {
+      attempts += 1;
+      const delayMs = Math.min(startupRetryBaseMs * 2 ** (attempts - 1), startupRetryMaxMs);
+      const reason = error instanceof Error ? error.message : String(error);
+      console.warn(`The Helm is unavailable (${reason}); retrying in ${delayMs}ms`);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
+await waitForCoordinator();
 setInterval(() => heartbeat().catch((error) => console.error(error)), 15_000);
-console.log(`Ordis worker ${nodeId} online; local Codex CLI execution only`);
+console.log(`Ordis Hand ${nodeId} online; local Codex CLI execution only`);

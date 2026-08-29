@@ -7,6 +7,20 @@ const apps: ReturnType<typeof buildServer>[] = [];
 afterEach(async () => { await Promise.all(apps.splice(0).map((app) => app.close())); });
 
 describe("coordinator", () => {
+  it("exposes health before authenticated API access", async () => {
+    const app = buildServer(new MemoryStore(), {
+      NODE_ENV: "test",
+      ORDIS_AUTH_MODE: "session",
+      ORDIS_SESSION_TOKEN: "private-test-token"
+    });
+    apps.push(app);
+    const health = await app.inject({ method: "GET", url: "/health" });
+    expect(health.statusCode).toBe(200);
+    expect(health.json()).toMatchObject({ ok: true, service: "ordis-coordinator" });
+    const guarded = await app.inject({ method: "GET", url: "/api/runs" });
+    expect(guarded.statusCode).toBe(401);
+  });
+
   it("queues work when allowance is available", async () => {
     const app = buildServer(new MemoryStore(), { NODE_ENV: "test", ORDIS_AUTH_MODE: "development", ORDIS_ALLOWANCE_STATE: "available" });
     apps.push(app);
