@@ -1,20 +1,39 @@
 import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
-import type { NodeHeartbeat, Project, Run, RunEvent } from "@ordis/shared";
+import {
+  ApprovalRequest,
+  ApprovalStatus,
+  NodeHeartbeat,
+  NodeRecord,
+  Project,
+  ProjectId,
+  ProjectRegistration,
+  ProjectRegistrationResult,
+  Run,
+  RunEvent,
+  RunEventInput,
+  RunId
+} from "@ordis/shared";
 
 export type JsonRecord = Record<string, unknown>;
-export type ProjectRegistrationResult = {
-  project: Project;
-  created: boolean;
-};
+const TABLE_ORDER = {
+  projects: "created_at",
+  nodes: "last_seen_at",
+  runs: "created_at",
+  approval_requests: "expires_at",
+  reports: "generated_at",
+  idea_graphs: "updated_at",
+  portfolio_transactions: "occurred_on"
+} as const;
+export type StoreTable = keyof typeof TABLE_ORDER;
 
 export interface OrdisStore {
-  list(table: "projects" | "nodes" | "runs" | "approval_requests" | "reports" | "idea_graphs" | "portfolio_transactions"): Promise<unknown[]>;
-  createRun(projectId: string, state: Run["state"], payload: JsonRecord): Promise<Run>;
-  appendEvent(runId: string, type: string, payload?: JsonRecord): Promise<RunEvent>;
+  list(table: StoreTable): Promise<unknown[]>;
+  createRun(projectId: Run["projectId"], state: Run["state"], payload: JsonRecord): Promise<Run>;
+  appendEvent(input: RunEventInput): Promise<RunEvent>;
   heartbeat(heartbeat: NodeHeartbeat): Promise<void>;
-  consumeApproval(id: string): Promise<boolean>;
-  registerProject(name: string, repositoryPath: string): Promise<ProjectRegistrationResult>;
+  consumeApproval(id: ApprovalRequest["id"]): Promise<boolean>;
+  registerProject(input: ProjectRegistration): Promise<ProjectRegistrationResult>;
   close(): Promise<void>;
 }
 
@@ -26,25 +45,33 @@ export class PgStore implements OrdisStore {
   constructor(private readonly pool: Pool) {}
   static connect(connectionString: string) { return new PgStore(new Pool({ connectionString })); }
 
-  async list(table: Parameters<OrdisStore["list"]>[0]) {
-    const result = await this.pool.query(`SELECT * FROM ${table} ORDER BY 1 DESC LIMIT 200`);
-    return result.rows.map(camel);
+  async list(table: StoreTable) {
+    const result = await this.pool.query(
+      `SELECT * FROM ${table} ORDER BY ${TABLE_ORDER[table]} DESC, id DESC LIMIT 200`
+    );
+    const rows = result.rows.map(camel);
+    if (table === "projects") return rows.map((row) => Project.parse(row));
+    if (table === "nodes") return rows.map((row) => NodeRecord.parse(row));
+    if (table === "approval_requests") return rows.map((row) => ApprovalRequest.parse(row));
+    return rows;
   }
-  async createRun(projectId: string, state: Run["state"], payload: JsonRecord) {
+  async createRun(projectId: Run["projectId"], state: Run["state"], payload: JsonRecord) {
     const result = await this.pool.query(
       `INSERT INTO runs(project_id,state,payload) VALUES ($1,$2,$3) RETURNING id,project_id,state,assigned_node_id,created_at,updated_at`,
       [projectId, state, payload]
     );
     return camel(result.rows[0]) as Run;
   }
-  async appendEvent(runId: string, type: string, payload: JsonRecord = {}) {
+  async appendEvent(input: RunEventInput) {
+    const event = RunEventInput.parse(input);
     const result = await this.pool.query(
       `INSERT INTO run_events(run_id,type,payload) VALUES ($1,$2,$3) RETURNING id,run_id,type,payload,occurred_at`,
-      [runId, type, payload]
+      [event.runId, event.type, event.payload]
     );
-    return camel(result.rows[0]) as RunEvent;
+    return RunEvent.parse(camel(result.rows[0]));
   }
-  async heartbeat(h: NodeHeartbeat) {
+  async heartbeat(input: NodeHeartbeat) {
+    const h = NodeHeartbeat.parse(input);
     await this.pool.query(
       `INSERT INTO nodes(id,platform,capabilities,allowance,active_runs,last_seen_at)
        VALUES($1,$2,$3,$4,$5,$6)
@@ -53,14 +80,16 @@ export class PgStore implements OrdisStore {
       [h.nodeId, h.platform, JSON.stringify(h.capabilities), h.allowance, h.activeRuns, h.observedAt]
     );
   }
-  async consumeApproval(id: string) {
+  async consumeApproval(id: ApprovalRequest["id"]) {
     const result = await this.pool.query(
-      `UPDATE approval_requests SET status='consumed',consumed_at=now()
-       WHERE id=$1 AND status='approved' AND consumed_at IS NULL AND expires_at>now() RETURNING id`, [id]
+      `UPDATE approval_requests SET status=$2,consumed_at=now()
+       WHERE id=$1 AND status=$3 AND consumed_at IS NULL AND expires_at>now() RETURNING id`,
+      [id, ApprovalStatus.enum.consumed, ApprovalStatus.enum.approved]
     );
     return result.rowCount === 1;
   }
-  async registerProject(name: string, repositoryPath: string): Promise<ProjectRegistrationResult> {
+  async registerProject(input: ProjectRegistration): Promise<ProjectRegistrationResult> {
+    const project = ProjectRegistration.parse(input);
     const result = await this.pool.query(
       `WITH inserted AS (
         INSERT INTO projects(name, repository_path)
@@ -74,20 +103,11 @@ export class PgStore implements OrdisStore {
       FROM projects
       WHERE repository_path = $2
       LIMIT 1`,
-      [name, repositoryPath]
+      [project.name, project.repositoryPath]
     );
 
-    const row = camel(result.rows[0]) as Project & { created: boolean };
-
-    return {
-      project: {
-        id: row.id,
-        name: row.name,
-        repositoryPath: row.repositoryPath,
-        createdAt: row.createdAt
-      },
-      created: row.created
-    };
+    const row = camel(result.rows[0]);
+    return ProjectRegistrationResult.parse({ project: row, created: row.created });
   }
   async close() { await this.pool.end(); }
 }
@@ -95,46 +115,60 @@ export class PgStore implements OrdisStore {
 export class MemoryStore implements OrdisStore {
   private runs: Run[] = [];
   private events: RunEvent[] = [];
-  private nodes: NodeHeartbeat[] = [];
+  private nodes: NodeRecord[] = [];
   private projects: Project[] = [];
 
-  async list(table: Parameters<OrdisStore["list"]>[0]) {
+  async list(table: StoreTable) {
     if (table === "projects") return this.projects;
     if (table === "runs") return this.runs;
     if (table === "nodes") return this.nodes;
-    return [];
+    throw new Error(`MemoryStore does not implement list(${table})`);
   }
-  async createRun(projectId: string, state: Run["state"]) {
+  async createRun(projectId: Run["projectId"], state: Run["state"], _payload: JsonRecord) {
     const now = new Date().toISOString();
-    const run: Run = { id: randomUUID(), projectId, state, assignedNodeId: null, createdAt: now, updatedAt: now };
+    const run = Run.parse({ id: RunId.parse(randomUUID()), projectId, state, assignedNodeId: null, createdAt: now, updatedAt: now });
     this.runs.unshift(run);
     return run;
   }
-  async appendEvent(runId: string, type: string, payload: JsonRecord = {}) {
-    const event: RunEvent = { id: this.events.length + 1, runId, type, payload, occurredAt: new Date().toISOString() };
+  async appendEvent(input: RunEventInput) {
+    const eventInput = RunEventInput.parse(input);
+    const event = RunEvent.parse({ id: this.events.length + 1, ...eventInput, occurredAt: new Date().toISOString() });
     this.events.push(event);
     return event;
   }
-  async heartbeat(h: NodeHeartbeat) { this.nodes = [h, ...this.nodes.filter((n) => n.nodeId !== h.nodeId)]; }
-  async consumeApproval() { return false; }
-  async registerProject(name: string, repositoryPath: string): Promise<ProjectRegistrationResult> {
+  async heartbeat(input: NodeHeartbeat) {
+    const h = NodeHeartbeat.parse(input);
+    const node = NodeRecord.parse({
+      id: h.nodeId,
+      platform: h.platform,
+      capabilities: h.capabilities,
+      activeRuns: h.activeRuns,
+      allowance: h.allowance,
+      lastSeenAt: h.observedAt
+    });
+    this.nodes = [node, ...this.nodes.filter((existing) => existing.id !== node.id)];
+  }
+  async consumeApproval(_id: ApprovalRequest["id"]): Promise<boolean> {
+    throw new Error("MemoryStore does not implement approval consumption");
+  }
+  async registerProject(input: ProjectRegistration): Promise<ProjectRegistrationResult> {
+    const registration = ProjectRegistration.parse(input);
     const existing = this.projects.find(
-      (project) => project.repositoryPath === repositoryPath
+      (project) => project.repositoryPath === registration.repositoryPath
     );
 
     if (existing) {
-      return { project: existing, created: false };
+      return ProjectRegistrationResult.parse({ project: existing, created: false });
     }
 
-    const project: Project = {
-      id: randomUUID(),
-      name,
-      repositoryPath,
+    const project = Project.parse({
+      id: ProjectId.parse(randomUUID()),
+      ...registration,
       createdAt: new Date().toISOString()
-    };
+    });
 
     this.projects.unshift(project);
-    return { project, created: true };
+    return ProjectRegistrationResult.parse({ project, created: true });
   }
   async close() {}
 }

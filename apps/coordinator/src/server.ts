@@ -1,7 +1,7 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import websocket from "@fastify/websocket";
-import { NodeHeartbeat, ProjectRegistration } from "@ordis/shared";
+import { ApprovalId, AuthMode, NodeHeartbeat, ProjectRegistration, RunRequest } from "@ordis/shared";
 import { initialRunState, readCostGuard } from "./cost-guard.js";
 import type { OrdisStore } from "./store.js";
 
@@ -17,11 +17,12 @@ const tableRoutes = {
 export function buildServer(store: OrdisStore, env: NodeJS.ProcessEnv = process.env) {
   const app = Fastify({ logger: env.NODE_ENV !== "test" });
   const clients = new Set<{ send(data: string): void; readyState: number }>();
+  const authMode = AuthMode.parse(env.ORDIS_AUTH_MODE ?? AuthMode.enum.passkey);
   app.register(cors, { origin: env.ORDIS_PUBLIC_ORIGIN?.split(",") ?? false, credentials: true });
   app.register(websocket);
 
   app.addHook("onRequest", async (request, reply) => {
-    if (request.url === "/health" || env.ORDIS_AUTH_MODE === "development") return;
+    if (request.url === "/health" || authMode === AuthMode.enum.development) return;
     const expected = env.ORDIS_SESSION_TOKEN;
     if (!expected || request.headers.authorization !== `Bearer ${expected}`) {
       return reply.code(401).send({ error: "passkey_session_required" });
@@ -42,10 +43,7 @@ export function buildServer(store: OrdisStore, env: NodeJS.ProcessEnv = process.
       });
     }
 
-    const result = await store.registerProject(
-      parsed.data.name,
-      parsed.data.repositoryPath
-    );
+    const result = await store.registerProject(parsed.data);
 
     return reply
       .code(result.created ? 201 : 200)
@@ -56,13 +54,18 @@ export function buildServer(store: OrdisStore, env: NodeJS.ProcessEnv = process.
   app.get("/api/portfolio/investments", async () => ({ mode: "read-only", items: await store.list("portfolio_transactions") }));
   app.get("/api/system/allowance", async () => readCostGuard(env));
 
-  app.post<{ Body: { projectId?: string; command?: string; arguments?: Record<string, unknown> } }>("/api/runs", async (request, reply) => {
-    if (!request.body?.projectId || !request.body.command) return reply.code(400).send({ error: "projectId and command are required" });
+  app.post<{ Body: unknown }>("/api/runs", async (request, reply) => {
+    const parsed = RunRequest.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid_run_request", issues: parsed.error.issues });
     const guard = readCostGuard(env);
-    const run = await store.createRun(request.body.projectId, initialRunState(guard), {
-      command: request.body.command, arguments: request.body.arguments ?? {}
+    const run = await store.createRun(parsed.data.projectId, initialRunState(guard), {
+      command: parsed.data.command, arguments: parsed.data.arguments
     });
-    const event = await store.appendEvent(run.id, "run.created", { state: run.state });
+    const event = await store.appendEvent({
+      runId: run.id,
+      type: "run.created",
+      payload: { state: run.state }
+    });
     const wire = JSON.stringify(event);
     for (const client of clients) if (client.readyState === 1) client.send(wire);
     return reply.code(201).send(run);
@@ -76,7 +79,9 @@ export function buildServer(store: OrdisStore, env: NodeJS.ProcessEnv = process.
   });
 
   app.post<{ Params: { id: string } }>("/api/approvals/:id/consume", async (request, reply) => {
-    const consumed = await store.consumeApproval(request.params.id);
+    const parsedId = ApprovalId.safeParse(request.params.id);
+    if (!parsedId.success) return reply.code(400).send({ error: "invalid_approval_id" });
+    const consumed = await store.consumeApproval(parsedId.data);
     return consumed ? reply.code(204).send() : reply.code(409).send({ error: "approval_not_active" });
   });
 

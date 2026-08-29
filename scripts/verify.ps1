@@ -1,5 +1,5 @@
 param(
-  [ValidateSet('all', 'test', 'typecheck', 'build', 'skills', 'subscription')]
+  [ValidateSet('all', 'test', 'typecheck', 'lint', 'build', 'skills', 'subscription')]
   [string]$Check = 'all'
 )
 
@@ -68,6 +68,9 @@ if ($Check -in @('all', 'test')) {
 }
 if ($Check -in @('all', 'typecheck')) {
   Invoke-PnpmCheck -Name 'typechecks' -Arguments @('-r', 'typecheck')
+}
+if ($Check -in @('all', 'lint')) {
+  Invoke-PnpmCheck -Name 'lint' -Arguments @('lint')
 }
 if ($Check -in @('all', 'build')) {
   Invoke-PnpmCheck -Name 'builds' -Arguments @('-r', 'build')

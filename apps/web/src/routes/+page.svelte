@@ -1,20 +1,31 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import {
+    CostGuardState,
+    NodeListResponse,
+    RunListResponse,
+    type NodeRecord,
+    type RunSummary
+  } from "@ordis/shared";
+
   const api = import.meta.env.VITE_ORDIS_API_URL ?? "http://127.0.0.1:4310";
-  let allowance: { allowance: string; mode: string } = { allowance: "unknown", mode: "subscription-only" };
-  let runs: Array<{ id: string; state: string; createdAt: string }> = [];
-  let nodes: Array<{ nodeId?: string; id?: string; platform: string; allowance: string }> = [];
+  let allowance: CostGuardState | undefined;
+  let runs: RunSummary[] = [];
+  let nodes: NodeRecord[] = [];
   let connected = false;
 
   async function refresh() {
-    const [guard, runData, nodeData] = await Promise.all([
-      fetch(`${api}/api/system/allowance`).then((r) => r.json()),
-      fetch(`${api}/api/runs`).then((r) => r.json()),
-      fetch(`${api}/api/nodes`).then((r) => r.json())
+    const [guardResponse, runResponse, nodeResponse] = await Promise.all([
+      fetch(`${api}/api/system/allowance`),
+      fetch(`${api}/api/runs`),
+      fetch(`${api}/api/nodes`)
     ]);
-    allowance = guard;
-    runs = runData.items;
-    nodes = nodeData.items;
+    for (const response of [guardResponse, runResponse, nodeResponse]) {
+      if (!response.ok) throw new Error(`Coordinator request failed: ${response.status}`);
+    }
+    allowance = CostGuardState.parse(await guardResponse.json());
+    runs = RunListResponse.parse(await runResponse.json()).items;
+    nodes = NodeListResponse.parse(await nodeResponse.json()).items;
   }
 
   onMount(() => {
@@ -39,18 +50,18 @@
 
   <section class="hero">
     <p class="eyebrow">SUBSCRIPTION GUARD</p>
-    <h2>{allowance.allowance}</h2>
+    <h2>{allowance?.allowance ?? "loading"}</h2>
     <p>Local Codex sessions only · direct API disabled</p>
   </section>
 
   <div class="grid">
     <section><div class="section-title"><h3>Active runs</h3><b>{runs.length}</b></div>
       {#if runs.length === 0}<p class="empty">No commands in the execution queue.</p>{/if}
-      {#each runs as run}<article><code>{run.id.slice(0, 8)}</code><strong>{run.state}</strong></article>{/each}
+      {#each runs as run (run.id)}<article><code>{run.id.slice(0, 8)}</code><strong>{run.state}</strong></article>{/each}
     </section>
     <section><div class="section-title"><h3>Worker nodes</h3><b>{nodes.length}</b></div>
       {#if nodes.length === 0}<p class="empty">Awaiting Windows or Arch heartbeat.</p>{/if}
-      {#each nodes as node}<article><code>{node.platform}</code><strong>{node.allowance}</strong></article>{/each}
+      {#each nodes as node (node.id)}<article><code>{node.platform}</code><strong>{node.allowance}</strong></article>{/each}
     </section>
   </div>
 </main>

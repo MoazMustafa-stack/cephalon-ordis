@@ -10,6 +10,9 @@
     "typecheck": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "test": "node --test"
   },
+  "dependencies": {
+    "@ordis/shared": "workspace:*"
+  },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.9",
     "@sveltejs/kit": "^2.37.0",
