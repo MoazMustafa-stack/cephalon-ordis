@@ -10,6 +10,7 @@ export const ApprovalId = Id.brand<"ApprovalId">();
 export const ReportId = Id.brand<"ReportId">();
 export const IdeaGraphId = Id.brand<"IdeaGraphId">();
 export const PortfolioTransactionId = Id.brand<"PortfolioTransactionId">();
+export const ThreadId = Id.brand<"ThreadId">();
 export const IdeaNodeId = z.string().min(1).brand<"IdeaNodeId">();
 export const IdempotencyKey = z.string().min(8).brand<"IdempotencyKey">();
 
@@ -23,6 +24,7 @@ export const ALLOWANCE_STATES = ["available", "limited", "exhausted", "unknown"]
 export const REPORT_KINDS = ["project", "daily", "weekly", "validation", "update"] as const;
 export const PORTFOLIO_SIDES = ["buy", "sell", "dividend", "fee", "deposit", "withdrawal"] as const;
 export const AUTH_MODES = ["development", "passkey"] as const;
+export const THREAD_STATES = ["planned", "dispatched"] as const;
 
 export const RunState = z.enum(RUN_STATES);
 export const ApprovalStatus = z.enum(APPROVAL_STATUSES);
@@ -31,6 +33,7 @@ export const AllowanceState = z.enum(ALLOWANCE_STATES);
 export const ReportKind = z.enum(REPORT_KINDS);
 export const PortfolioSide = z.enum(PORTFOLIO_SIDES);
 export const AuthMode = z.enum(AUTH_MODES);
+export const ThreadState = z.enum(THREAD_STATES);
 
 export const ProjectRegistration = z.object({
   name: z.string().trim().min(1).max(120),
@@ -43,6 +46,24 @@ export const Project = ProjectRegistration.extend({
 export const ProjectRegistrationResult = z.object({
   project: Project,
   created: z.boolean()
+});
+export const ProjectListResponse = z.object({ items: z.array(Project) });
+
+export const ChartRequest = z.object({
+  projectId: ProjectId,
+  objective: z.string().trim().min(1).max(4000)
+});
+export const Thread = ChartRequest.extend({
+  id: ThreadId,
+  state: ThreadState,
+  createdAt: IsoDate,
+  updatedAt: IsoDate
+});
+export const ThreadListResponse = z.object({ items: z.array(Thread) });
+
+export const DispatchRequest = z.object({ threadId: ThreadId });
+export const DispatchRunPayload = ChartRequest.pick({ objective: true }).extend({
+  threadId: ThreadId
 });
 
 export const CommandEnvelope = z.object({
@@ -82,10 +103,18 @@ export const RunSummary = Run.pick({
   createdAt: true
 });
 
+export const RUN_EVENT_TYPES = [
+  "run.created",
+  "commission.dispatched",
+  "commission.claimed",
+  "commission.succeeded",
+  "commission.failed"
+] as const;
+export const RunEventType = z.enum(RUN_EVENT_TYPES);
 export const RunEvent = z.object({
   id: z.number().int().positive(),
   runId: RunId,
-  type: z.string().min(1),
+  type: RunEventType,
   payload: z.record(z.string(), z.unknown()).default({}),
   occurredAt: IsoDate
 });
@@ -93,6 +122,26 @@ export const RunEventInput = RunEvent.pick({
   runId: true,
   type: true,
   payload: true
+});
+export const COMMISSION_COMPLETION_STATES = [
+  RunState.enum.succeeded,
+  RunState.enum.failed
+] as const;
+export const CommissionCompletionState = z.enum(COMMISSION_COMPLETION_STATES);
+export const CommissionClaim = z.object({
+  run: Run,
+  project: Project,
+  event: RunEvent
+});
+export const CommissionCompletionInput = z.object({
+  runId: RunId,
+  nodeId: NodeId,
+  state: CommissionCompletionState,
+  exitCode: z.number().int().nullable().default(null)
+});
+export const CommissionCompletion = z.object({
+  run: Run,
+  event: RunEvent
 });
 
 export const ApprovalRequest = z.object({
@@ -119,8 +168,52 @@ export const NodeRecord = NodeRuntimeState.extend({
   id: NodeId,
   lastSeenAt: IsoDate
 });
+export const NODE_PULSE_TTL_MS = 60_000;
+export const MAX_DISPATCH_ACTIVE_RUNS = 0;
+export const DISPATCHABLE_ALLOWANCE_STATES = [
+  AllowanceState.enum.available,
+  AllowanceState.enum.limited
+] as const;
+export const ACTIVE_ASSIGNMENT_RUN_STATES = [
+  RunState.enum.queued,
+  RunState.enum.claimed,
+  RunState.enum.running,
+  RunState.enum.awaiting_approval
+] as const;
+export const NODE_PRESENCES = ["active", "offline"] as const;
+export const NodePresence = z.enum(NODE_PRESENCES);
+export const NodeStatus = NodeRecord.extend({ presence: NodePresence });
+
+export function isNodeFresh(node: NodeRecord, now = Date.now()) {
+  return Date.parse(node.lastSeenAt) >= now - NODE_PULSE_TTL_MS;
+}
+
+export function nodeFreshnessCutoff(now = Date.now()) {
+  return new Date(now - NODE_PULSE_TTL_MS).toISOString();
+}
+
+export function nodePresence(node: NodeRecord, now = Date.now()) {
+  return isNodeFresh(node, now) ? NodePresence.enum.active : NodePresence.enum.offline;
+}
+
+export function presentNode(node: NodeRecord, now = Date.now()) {
+  return NodeStatus.parse({ ...node, presence: nodePresence(node, now) });
+}
+
+export function isDispatchableNode(node: NodeRecord, now = Date.now()) {
+  return isNodeFresh(node, now)
+    && node.activeRuns <= MAX_DISPATCH_ACTIVE_RUNS
+    && DISPATCHABLE_ALLOWANCE_STATES.some((allowance) => allowance === node.allowance);
+}
+
+export const DispatchResult = z.object({
+  thread: Thread,
+  run: Run,
+  node: NodeRecord,
+  event: RunEvent
+});
 export const RunListResponse = z.object({ items: z.array(RunSummary) });
-export const NodeListResponse = z.object({ items: z.array(NodeRecord) });
+export const NodeListResponse = z.object({ items: z.array(NodeStatus) });
 
 export const Evidence = z.object({
   label: z.string().min(1),
@@ -175,6 +268,10 @@ export type RunCreateInput = z.infer<typeof RunCreateInput>;
 export type RunSummary = z.infer<typeof RunSummary>;
 export type RunEvent = z.infer<typeof RunEvent>;
 export type RunEventInput = z.infer<typeof RunEventInput>;
+export type RunEventType = z.infer<typeof RunEventType>;
+export type CommissionClaim = z.infer<typeof CommissionClaim>;
+export type CommissionCompletionInput = z.infer<typeof CommissionCompletionInput>;
+export type CommissionCompletion = z.infer<typeof CommissionCompletion>;
 export type ApprovalRequest = z.infer<typeof ApprovalRequest>;
 export type NodeHeartbeat = z.infer<typeof NodeHeartbeat>;
 export type Report = z.infer<typeof Report>;
@@ -184,4 +281,10 @@ export type CostGuardState = z.infer<typeof CostGuardState>;
 export type ProjectRegistration = z.infer<typeof ProjectRegistration>;
 export type Project = z.infer<typeof Project>;
 export type ProjectRegistrationResult = z.infer<typeof ProjectRegistrationResult>;
+export type ChartRequest = z.infer<typeof ChartRequest>;
+export type Thread = z.infer<typeof Thread>;
+export type DispatchRequest = z.infer<typeof DispatchRequest>;
+export type DispatchRunPayload = z.infer<typeof DispatchRunPayload>;
+export type DispatchResult = z.infer<typeof DispatchResult>;
 export type NodeRecord = z.infer<typeof NodeRecord>;
+export type NodeStatus = z.infer<typeof NodeStatus>;

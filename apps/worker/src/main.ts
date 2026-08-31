@@ -1,8 +1,20 @@
+import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import { realpath } from "node:fs/promises";
 import { platform } from "node:os";
-import { AllowanceState, NodeHeartbeat, NodeId, NodePlatform } from "@ordis/shared";
+import { promisify } from "node:util";
+import {
+  AllowanceState,
+  CommissionClaim,
+  CommissionCompletion,
+  DispatchRunPayload,
+  NodeHeartbeat,
+  NodeId,
+  NodePlatform,
+  RunState
+} from "@ordis/shared";
 
+const execFileAsync = promisify(execFile);
 if (process.env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is forbidden; authenticate the local Codex CLI with ChatGPT Plus");
 const coordinator = process.env.ORDIS_COORDINATOR_URL ?? "http://127.0.0.1:4310";
 const nodeId = NodeId.parse(process.env.ORDIS_NODE_ID ?? randomUUID());
@@ -10,6 +22,10 @@ const token = process.env.ORDIS_SESSION_TOKEN;
 const headers = { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) };
 const startupRetryBaseMs = 1_000;
 const startupRetryMaxMs = 15_000;
+const commissionPollMs = 5_000;
+const executionEnabled = process.env.ORDIS_HAND_EXECUTION_ENABLED === "true";
+let activeRuns = 0;
+let executing = false;
 
 export function runCodexInWorktree(prompt: string, worktree: string) {
   return spawn("codex", ["exec", "--json", "--cd", worktree, prompt], {
@@ -18,12 +34,25 @@ export function runCodexInWorktree(prompt: string, worktree: string) {
   });
 }
 
+async function resolveGitWorktree(repositoryPath: string) {
+  const candidate = await realpath(repositoryPath);
+  const { stdout } = await execFileAsync("git", ["-C", candidate, "rev-parse", "--show-toplevel"]);
+  return realpath(stdout.trim());
+}
+
+function waitForExit(child: ReturnType<typeof runCodexInWorktree>) {
+  return new Promise<number | null>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code) => resolve(code));
+  });
+}
+
 async function heartbeat() {
   const body = NodeHeartbeat.parse({
     nodeId,
     platform: platform() === "win32" ? NodePlatform.enum.windows : NodePlatform.enum.arch,
     capabilities: ["codex-cli", "git-worktrees", "local-artifacts"],
-    activeRuns: 0,
+    activeRuns,
     allowance: AllowanceState.parse(process.env.ORDIS_ALLOWANCE_STATE ?? AllowanceState.enum.unknown),
     observedAt: new Date().toISOString()
   });
@@ -47,6 +76,52 @@ async function waitForCoordinator() {
   }
 }
 
+async function completeClaim(claim: CommissionClaim, state: RunState, exitCode: number | null) {
+  const response = await fetch(`${coordinator}/api/runs/${claim.run.id}/complete`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ nodeId, state, exitCode })
+  });
+  if (!response.ok) throw new Error(`commission completion failed: ${response.status}`);
+  CommissionCompletion.parse(await response.json());
+}
+
+async function pollCommission() {
+  if (!executionEnabled || executing) return;
+  const response = await fetch(`${coordinator}/api/hands/${nodeId}/claim`, { method: "POST", headers });
+  if (response.status === 204) return;
+  if (!response.ok) throw new Error(`commission claim failed: ${response.status}`);
+
+  const claim = CommissionClaim.parse(await response.json());
+  const payload = DispatchRunPayload.parse(claim.run.payload);
+  executing = true;
+  activeRuns = 1;
+  await heartbeat();
+  try {
+    const worktree = await resolveGitWorktree(claim.project.repositoryPath);
+    console.log(`Executing Commission ${claim.run.id} in ${worktree}`);
+    const exitCode = await waitForExit(runCodexInWorktree(payload.objective, worktree));
+    await completeClaim(claim, exitCode === 0 ? RunState.enum.succeeded : RunState.enum.failed, exitCode);
+  } catch (error) {
+    console.error(`Commission ${claim.run.id} failed`, error);
+    try {
+      await completeClaim(claim, RunState.enum.failed, null);
+    } catch (completionError) {
+      console.error(`Unable to record failure for Commission ${claim.run.id}`, completionError);
+    }
+  } finally {
+    activeRuns = 0;
+    executing = false;
+    await heartbeat();
+  }
+}
+
 await waitForCoordinator();
 setInterval(() => heartbeat().catch((error) => console.error(error)), 15_000);
-console.log(`Ordis Hand ${nodeId} online; local Codex CLI execution only`);
+if (executionEnabled) {
+  console.log(`Ordis Hand ${nodeId} online; execution is enabled for assigned Commissions only`);
+  await pollCommission();
+  setInterval(() => pollCommission().catch((error) => console.error(error)), commissionPollMs);
+} else {
+  console.log(`Ordis Hand ${nodeId} online; set ORDIS_HAND_EXECUTION_ENABLED=true to execute assigned Commissions`);
+}

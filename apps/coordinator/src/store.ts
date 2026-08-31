@@ -3,8 +3,18 @@ import { Pool } from "pg";
 import {
   ApprovalRequest,
   ApprovalStatus,
+  ACTIVE_ASSIGNMENT_RUN_STATES,
+  CommissionClaim,
+  CommissionCompletion,
+  CommissionCompletionInput,
   NodeHeartbeat,
+  NodeId,
   NodeRecord,
+  DISPATCHABLE_ALLOWANCE_STATES,
+  DispatchRequest,
+  DispatchResult,
+  DispatchRunPayload,
+  MAX_DISPATCH_ACTIVE_RUNS,
   Project,
   ProjectId,
   ProjectRegistration,
@@ -13,12 +23,21 @@ import {
   RunCreateInput,
   RunEvent,
   RunEventInput,
-  RunId
+  RunEventType,
+  RunId,
+  Thread,
+  ThreadId,
+  ChartRequest,
+  ThreadState,
+  RunState,
+  isDispatchableNode,
+  nodeFreshnessCutoff
 } from "@ordis/shared";
 
 export type JsonRecord = Record<string, unknown>;
 const TABLE_ORDER = {
   projects: "created_at",
+  threads: "created_at",
   nodes: "last_seen_at",
   runs: "created_at",
   approval_requests: "expires_at",
@@ -35,7 +54,25 @@ export interface OrdisStore {
   heartbeat(heartbeat: NodeHeartbeat): Promise<void>;
   consumeApproval(id: ApprovalRequest["id"]): Promise<boolean>;
   registerProject(input: ProjectRegistration): Promise<ProjectRegistrationResult>;
+  createThread(input: ChartRequest): Promise<Thread>;
+  dispatchThread(input: DispatchRequest): Promise<DispatchResult>;
+  claimCommission(nodeId: NodeHeartbeat["nodeId"]): Promise<CommissionClaim | null>;
+  completeCommission(input: CommissionCompletionInput): Promise<CommissionCompletion>;
   close(): Promise<void>;
+}
+
+export class DispatchUnavailableError extends Error {
+  constructor() {
+    super("Dispatch requires a planned Thread and an active available Hand");
+    this.name = "DispatchUnavailableError";
+  }
+}
+
+export class CommissionTransitionError extends Error {
+  constructor() {
+    super("The Commission is not assigned to this Hand in the required state");
+    this.name = "CommissionTransitionError";
+  }
 }
 
 const camel = (row: JsonRecord): JsonRecord => Object.fromEntries(
@@ -52,6 +89,7 @@ export class PgStore implements OrdisStore {
     );
     const rows = result.rows.map(camel);
     if (table === "projects") return rows.map((row) => Project.parse(row));
+    if (table === "threads") return rows.map((row) => Thread.parse(row));
     if (table === "nodes") return rows.map((row) => NodeRecord.parse(row));
     if (table === "runs") return rows.map((row) => Run.parse(row));
     if (table === "approval_requests") return rows.map((row) => ApprovalRequest.parse(row));
@@ -113,6 +151,128 @@ export class PgStore implements OrdisStore {
     const row = camel(result.rows[0]);
     return ProjectRegistrationResult.parse({ project: row, created: row.created });
   }
+  async createThread(input: ChartRequest) {
+    const chart = ChartRequest.parse(input);
+    const result = await this.pool.query(
+      `INSERT INTO threads(project_id,objective,state) VALUES ($1,$2,$3)
+       RETURNING id,project_id,objective,state,created_at,updated_at`,
+      [chart.projectId, chart.objective, ThreadState.enum.planned]
+    );
+    return Thread.parse(camel(result.rows[0]));
+  }
+  async dispatchThread(input: DispatchRequest) {
+    const dispatch = DispatchRequest.parse(input);
+    const result = await this.pool.query(
+      `WITH target_thread AS (
+         SELECT id, project_id, objective, state, created_at, updated_at
+         FROM threads WHERE id=$1 AND state=$2
+       ), selected_node AS (
+         SELECT nodes.* FROM nodes
+         WHERE EXISTS (SELECT 1 FROM target_thread)
+           AND last_seen_at >= $3
+           AND active_runs <= $4
+           AND allowance = ANY($5::text[])
+           AND NOT EXISTS (
+             SELECT 1 FROM runs
+             WHERE assigned_node_id=nodes.id AND state = ANY($6::run_state[])
+           )
+         ORDER BY last_seen_at DESC
+         LIMIT 1 FOR UPDATE SKIP LOCKED
+       ), updated_thread AS (
+         UPDATE threads SET state=$7, updated_at=now()
+         FROM target_thread, selected_node
+         WHERE threads.id=target_thread.id
+         RETURNING threads.id, threads.project_id, threads.objective, threads.state, threads.created_at, threads.updated_at
+       ), created_run AS (
+         INSERT INTO runs(project_id,command_id,state,assigned_node_id,payload)
+         SELECT updated_thread.project_id, NULL, $8, selected_node.id,
+           jsonb_build_object('threadId', updated_thread.id, 'objective', updated_thread.objective)
+         FROM updated_thread CROSS JOIN selected_node
+         RETURNING id, project_id, command_id, state, assigned_node_id, payload, created_at, updated_at
+       ), created_event AS (
+         INSERT INTO run_events(run_id,type,payload)
+         SELECT created_run.id, $9,
+           jsonb_build_object('threadId', updated_thread.id, 'nodeId', selected_node.id, 'state', created_run.state)
+         FROM created_run CROSS JOIN updated_thread CROSS JOIN selected_node
+         RETURNING id, run_id, type, payload, occurred_at
+       )
+       SELECT row_to_json(updated_thread) AS thread, row_to_json(created_run) AS run,
+              row_to_json(selected_node) AS node, row_to_json(created_event) AS event
+       FROM updated_thread CROSS JOIN created_run CROSS JOIN selected_node CROSS JOIN created_event`,
+      [
+        dispatch.threadId,
+        ThreadState.enum.planned,
+        nodeFreshnessCutoff(),
+        MAX_DISPATCH_ACTIVE_RUNS,
+        DISPATCHABLE_ALLOWANCE_STATES,
+        ACTIVE_ASSIGNMENT_RUN_STATES,
+        ThreadState.enum.dispatched,
+        RunState.enum.queued,
+        RunEventType.enum["commission.dispatched"]
+      ]
+    );
+    if (!result.rows[0]) throw new DispatchUnavailableError();
+    const row = result.rows[0] as { thread: JsonRecord; run: JsonRecord; node: JsonRecord; event: JsonRecord };
+    return DispatchResult.parse({
+      thread: camel(row.thread),
+      run: camel(row.run),
+      node: camel(row.node),
+      event: camel(row.event)
+    });
+  }
+  async claimCommission(nodeId: NodeHeartbeat["nodeId"]) {
+    const handId = NodeId.parse(nodeId);
+    const result = await this.pool.query(
+      `WITH selected_run AS (
+         SELECT id FROM runs
+         WHERE assigned_node_id=$1 AND state=$2
+         ORDER BY created_at ASC
+         LIMIT 1 FOR UPDATE SKIP LOCKED
+       ), claimed_run AS (
+         UPDATE runs SET state=$3, updated_at=now()
+         FROM selected_run WHERE runs.id=selected_run.id
+         RETURNING runs.id, runs.project_id, runs.command_id, runs.state, runs.assigned_node_id, runs.payload, runs.created_at, runs.updated_at
+       ), created_event AS (
+         INSERT INTO run_events(run_id,type,payload)
+         SELECT claimed_run.id, $4, jsonb_build_object('nodeId', $1, 'state', claimed_run.state)
+         FROM claimed_run
+         RETURNING id, run_id, type, payload, occurred_at
+       )
+       SELECT row_to_json(claimed_run) AS run, row_to_json(projects) AS project,
+              row_to_json(created_event) AS event
+       FROM claimed_run
+       JOIN projects ON projects.id=claimed_run.project_id
+       CROSS JOIN created_event`,
+      [handId, RunState.enum.queued, RunState.enum.claimed, RunEventType.enum["commission.claimed"]]
+    );
+    if (!result.rows[0]) return null;
+    const row = result.rows[0] as { run: JsonRecord; project: JsonRecord; event: JsonRecord };
+    return CommissionClaim.parse({ run: camel(row.run), project: camel(row.project), event: camel(row.event) });
+  }
+  async completeCommission(input: CommissionCompletionInput) {
+    const completion = CommissionCompletionInput.parse(input);
+    const eventType = completion.state === RunState.enum.succeeded
+      ? RunEventType.enum["commission.succeeded"]
+      : RunEventType.enum["commission.failed"];
+    const result = await this.pool.query(
+      `WITH completed_run AS (
+         UPDATE runs SET state=$3, updated_at=now()
+         WHERE id=$1 AND assigned_node_id=$2 AND state=$4
+         RETURNING id, project_id, command_id, state, assigned_node_id, payload, created_at, updated_at
+       ), created_event AS (
+         INSERT INTO run_events(run_id,type,payload)
+         SELECT completed_run.id, $5, jsonb_build_object('nodeId', $2, 'state', completed_run.state, 'exitCode', $6)
+         FROM completed_run
+         RETURNING id, run_id, type, payload, occurred_at
+       )
+       SELECT row_to_json(completed_run) AS run, row_to_json(created_event) AS event
+       FROM completed_run CROSS JOIN created_event`,
+      [completion.runId, completion.nodeId, completion.state, RunState.enum.claimed, eventType, completion.exitCode]
+    );
+    if (!result.rows[0]) throw new CommissionTransitionError();
+    const row = result.rows[0] as { run: JsonRecord; event: JsonRecord };
+    return CommissionCompletion.parse({ run: camel(row.run), event: camel(row.event) });
+  }
   async close() { await this.pool.end(); }
 }
 
@@ -121,9 +281,11 @@ export class MemoryStore implements OrdisStore {
   private events: RunEvent[] = [];
   private nodes: NodeRecord[] = [];
   private projects: Project[] = [];
+  private threads: Thread[] = [];
 
   async list(table: StoreTable) {
     if (table === "projects") return this.projects;
+    if (table === "threads") return this.threads;
     if (table === "runs") return this.runs;
     if (table === "nodes") return this.nodes;
     throw new Error(`MemoryStore does not implement list(${table})`);
@@ -180,6 +342,97 @@ export class MemoryStore implements OrdisStore {
 
     this.projects.unshift(project);
     return ProjectRegistrationResult.parse({ project, created: true });
+  }
+  async createThread(input: ChartRequest) {
+    const chart = ChartRequest.parse(input);
+    if (!this.projects.some((project) => project.id === chart.projectId)) {
+      throw new Error(`Project ${chart.projectId} does not exist`);
+    }
+    const now = new Date().toISOString();
+    const thread = Thread.parse({
+      id: ThreadId.parse(randomUUID()),
+      ...chart,
+      state: ThreadState.enum.planned,
+      createdAt: now,
+      updatedAt: now
+    });
+    this.threads.unshift(thread);
+    return thread;
+  }
+  async dispatchThread(input: DispatchRequest) {
+    const dispatch = DispatchRequest.parse(input);
+    const threadIndex = this.threads.findIndex(
+      (thread) => thread.id === dispatch.threadId && thread.state === ThreadState.enum.planned
+    );
+    const node = this.nodes.find((candidate) => isDispatchableNode(candidate)
+      && !this.runs.some((run) => run.assignedNodeId === candidate.id
+        && ACTIVE_ASSIGNMENT_RUN_STATES.some((state) => state === run.state)));
+    if (threadIndex === -1 || !node) throw new DispatchUnavailableError();
+
+    const currentThread = this.threads[threadIndex];
+    const now = new Date().toISOString();
+    const thread = Thread.parse({ ...currentThread, state: ThreadState.enum.dispatched, updatedAt: now });
+    const payload = DispatchRunPayload.parse({ threadId: thread.id, objective: thread.objective });
+    const run = Run.parse({
+      id: RunId.parse(randomUUID()),
+      projectId: thread.projectId,
+      commandId: null,
+      state: RunState.enum.queued,
+      assignedNodeId: node.id,
+      payload,
+      createdAt: now,
+      updatedAt: now
+    });
+    const event = RunEvent.parse({
+      id: this.events.length + 1,
+      runId: run.id,
+      type: RunEventType.enum["commission.dispatched"],
+      payload: { threadId: thread.id, nodeId: node.id, state: run.state },
+      occurredAt: now
+    });
+    this.threads[threadIndex] = thread;
+    this.runs.unshift(run);
+    this.events.push(event);
+    return DispatchResult.parse({ thread, run, node, event });
+  }
+  async claimCommission(nodeId: NodeHeartbeat["nodeId"]) {
+    const handId = NodeId.parse(nodeId);
+    const runIndex = this.runs.findIndex((run) => run.assignedNodeId === handId && run.state === RunState.enum.queued);
+    if (runIndex === -1) return null;
+    const project = this.projects.find((candidate) => candidate.id === this.runs[runIndex].projectId);
+    if (!project) throw new Error(`Project ${this.runs[runIndex].projectId} does not exist`);
+    const now = new Date().toISOString();
+    const run = Run.parse({ ...this.runs[runIndex], state: RunState.enum.claimed, updatedAt: now });
+    const event = RunEvent.parse({
+      id: this.events.length + 1,
+      runId: run.id,
+      type: RunEventType.enum["commission.claimed"],
+      payload: { nodeId: handId, state: run.state },
+      occurredAt: now
+    });
+    this.runs[runIndex] = run;
+    this.events.push(event);
+    return CommissionClaim.parse({ run, project, event });
+  }
+  async completeCommission(input: CommissionCompletionInput) {
+    const completion = CommissionCompletionInput.parse(input);
+    const runIndex = this.runs.findIndex((run) => run.id === completion.runId
+      && run.assignedNodeId === completion.nodeId && run.state === RunState.enum.claimed);
+    if (runIndex === -1) throw new CommissionTransitionError();
+    const now = new Date().toISOString();
+    const run = Run.parse({ ...this.runs[runIndex], state: completion.state, updatedAt: now });
+    const event = RunEvent.parse({
+      id: this.events.length + 1,
+      runId: run.id,
+      type: completion.state === RunState.enum.succeeded
+        ? RunEventType.enum["commission.succeeded"]
+        : RunEventType.enum["commission.failed"],
+      payload: { nodeId: completion.nodeId, state: run.state, exitCode: completion.exitCode },
+      occurredAt: now
+    });
+    this.runs[runIndex] = run;
+    this.events.push(event);
+    return CommissionCompletion.parse({ run, event });
   }
   async close() {}
 }

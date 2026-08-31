@@ -21,6 +21,16 @@ if (-not $SkipPostgres) {
   Write-Host 'Starting PostgreSQL...' -ForegroundColor Cyan
   & $dockerExe compose --file (Join-Path $repoRoot 'compose.yaml') up -d --wait --wait-timeout 60 postgres
   if ($LASTEXITCODE -ne 0) { throw 'PostgreSQL failed to start.' }
+
+  Write-Host 'Applying Chart migration...' -ForegroundColor Cyan
+  & $dockerExe compose --file (Join-Path $repoRoot 'compose.yaml') exec -T postgres `
+    psql -v ON_ERROR_STOP=1 -U ordis -d ordis -f /docker-entrypoint-initdb.d/002_chart_threads.sql
+  if ($LASTEXITCODE -ne 0) { throw 'The Chart migration failed.' }
+
+  Write-Host 'Applying Dispatch migration...' -ForegroundColor Cyan
+  & $dockerExe compose --file (Join-Path $repoRoot 'compose.yaml') exec -T postgres `
+    psql -v ON_ERROR_STOP=1 -U ordis -d ordis -f /docker-entrypoint-initdb.d/003_dispatch_threads.sql
+  if ($LASTEXITCODE -ne 0) { throw 'The Dispatch migration failed.' }
 }
 
 $shellCommand = (Get-Command powershell.exe -ErrorAction Stop).Source
