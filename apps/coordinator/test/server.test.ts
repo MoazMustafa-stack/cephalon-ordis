@@ -27,7 +27,11 @@ describe("coordinator", () => {
     apps.push(app);
     const response = await app.inject({ method: "POST", url: "/api/runs", payload: { projectId: randomUUID(), command: "project-report" } });
     expect(response.statusCode).toBe(201);
-    expect(response.json().state).toBe(RunState.enum.queued);
+    expect(response.json()).toMatchObject({
+      state: RunState.enum.queued,
+      commandId: null,
+      payload: { command: "project-report", arguments: {} }
+    });
   });
 
   it("rejects invalid run requests at the HTTP boundary", async () => {

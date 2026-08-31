@@ -24,7 +24,7 @@ CREATE TABLE nodes (
 CREATE TABLE runs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   project_id uuid NOT NULL REFERENCES projects(id),
-  command_id uuid,
+  command_id uuid NULL,
   state run_state NOT NULL DEFAULT 'queued',
   assigned_node_id uuid REFERENCES nodes(id),
   payload jsonb NOT NULL DEFAULT '{}',

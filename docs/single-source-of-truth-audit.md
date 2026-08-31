@@ -1,6 +1,6 @@
 # Single-source-of-truth audit
 
-Date: 2026-08-30
+Date: 2026-08-31
 
 Scope: `@ordis/shared`, coordinator stores and HTTP handlers, worker,
 web client, MCP package, configuration examples, and the initial PostgreSQL
@@ -21,6 +21,7 @@ migration.
 | D-09 | `apps/coordinator/src/store.ts`: `PgStore.list` | `ORDER BY 1 DESC` sorted UUID primary keys as though they represented recency. | Every table maps to its time/date column and uses `id` only as a deterministic tie-breaker. |
 | D-10 | `apps/web/src/routes/+page.svelte`; `packages/ordis-mcp/src/index.ts` | HTTP JSON was trusted and the web client duplicated run/node/allowance shapes. | Added derived `RunSummary`, `RunListResponse`, and `NodeListResponse`; all used responses are status-checked and parsed. |
 | D-11 | `packages/ordis-mcp/src/index.ts`: `ordis_queue` response | A successful run response crossed the HTTP boundary as unchecked text. | Successful responses are parsed as `RunSummary`; error bodies remain diagnostic text. |
+| D-12 | `packages/shared/src/index.ts`: `Run`; `apps/coordinator/src/store.ts`: `createRun` and `list("runs")` | PostgreSQL stored `payload` and nullable `command_id`, while the shared entity omitted payload, modeled a non-null optional ID, and MemoryStore discarded payload. | `Run` now owns nullable `commandId` and `payload`; `RunCreateInput` drives both stores. Every returned or listed run is parsed, and PostgreSQL/memory parity tests cover both fields. |
 
 ## Consolidated latent duplication
 
@@ -42,23 +43,19 @@ data-compatibility model. They were intentionally not guessed.
 
 | ID | Location | Current conflict | Decision required |
 | --- | --- | --- | --- |
-| P-01 | `packages/shared/src/index.ts`: `Run`; `db/migrations/001_initial.sql`: `runs`; `apps/coordinator/src/store.ts`: `createRun` | PostgreSQL stores `payload`, but `Run` does not model it. `Run.commandId` is modeled, but create/select do not write or return it; a database null would also conflict with an optional non-null schema field. MemoryStore cannot retain payload without inventing an output model. | Decide whether payload belongs on the canonical run, whether command envelopes are persisted separately, and whether `commandId` is required, nullable, or removed. Then remove the remaining `as Run` and parse all run rows. |
 | P-02 | `packages/shared/src/index.ts`: `Report`; `db/migrations/001_initial.sql`: `reports` | Shared reports have `summary` and `evidence`; the table has one untyped `body` JSONB column and no kind constraint. | Decide whether `body` contains the complete shared report or whether summary/evidence become columns. Add a migration and parse report rows afterward. |
 | P-03 | `packages/shared/src/index.ts`: `IdeaGraph`; `db/migrations/001_initial.sql`: `idea_graphs` | Shared graphs expose `nodes` and `edges`; PostgreSQL exposes one `graph` JSONB value. | Decide the wire/storage representation and migration strategy, then parse graph rows. |
 | P-04 | `packages/shared/src/index.ts`: `PortfolioTransaction`; PostgreSQL `numeric` columns | The shared model requires JavaScript numbers, while `pg` returns arbitrary-precision numeric values as strings by default. Coercing can lose precision. | Choose decimal strings/decimal library versus bounded JavaScript numbers; then add a canonical row mapper and parse rows. |
 | P-05 | `ProjectRegistration.repositoryPath`; PostgreSQL `projects.repository_path UNIQUE`; `MemoryStore.registerProject` | Exact string equality does not represent Windows path identity: case, separators, and resolved aliases may name the same repository. | Choose a canonical path normalization and cross-platform uniqueness policy before changing persisted keys. |
 
-Because P-01 through P-04 are unresolved, `PgStore.list` deliberately leaves
-run, report, graph, and portfolio rows as unknown raw records. Safe public
-consumers parse only the canonical projections they use.
+Because P-02 through P-04 are unresolved, `PgStore.list` deliberately leaves
+report, graph, and portfolio rows as unknown raw records. Runs are fully parsed.
 
 ## Interface review
 
 `OrdisStore` is the only multi-implementation application contract found.
-`PgStore` and `MemoryStore` now have matching method signatures. Unsupported
-memory operations fail explicitly. The only remaining behavioral mismatch is
-P-01 payload persistence, which is visible in this report and no longer hidden
-by a narrower TypeScript method signature.
+`PgStore` and `MemoryStore` now have matching method signatures and Run
+creation behavior. Unsupported memory operations fail explicitly.
 
 ## Verification
 
@@ -72,6 +69,6 @@ TypeScript, and Svelte. `scripts/verify.ps1` runs:
 5. plugin skill validation;
 6. the subscription-only security audit.
 
-Final audit run: 22 coordinator tests passed; all package typechecks passed;
+Final Run-contract batch: 24 coordinator tests passed; all package typechecks passed;
 ESLint passed with no findings; all builds passed; all plugin skills validated;
 the subscription-only audit passed.

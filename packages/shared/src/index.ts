@@ -63,11 +63,18 @@ export const RunRequest = CommandEnvelope.pick({
 export const Run = z.object({
   id: RunId,
   projectId: ProjectId,
-  commandId: CommandId.optional(),
+  commandId: CommandId.nullable().default(null),
   state: RunState,
   assignedNodeId: NodeId.nullable().default(null),
+  payload: z.record(z.string(), z.unknown()).default({}),
   createdAt: IsoDate,
   updatedAt: IsoDate
+});
+export const RunCreateInput = Run.pick({
+  projectId: true,
+  commandId: true,
+  state: true,
+  payload: true
 });
 export const RunSummary = Run.pick({
   id: true,
@@ -164,6 +171,7 @@ export type CommandEnvelope = z.infer<typeof CommandEnvelope>;
 export type RunRequest = z.infer<typeof RunRequest>;
 export type RunState = z.infer<typeof RunState>;
 export type Run = z.infer<typeof Run>;
+export type RunCreateInput = z.infer<typeof RunCreateInput>;
 export type RunSummary = z.infer<typeof RunSummary>;
 export type RunEvent = z.infer<typeof RunEvent>;
 export type RunEventInput = z.infer<typeof RunEventInput>;

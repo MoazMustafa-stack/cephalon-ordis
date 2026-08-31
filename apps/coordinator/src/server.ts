@@ -58,8 +58,14 @@ export function buildServer(store: OrdisStore, env: NodeJS.ProcessEnv = process.
     const parsed = RunRequest.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_run_request", issues: parsed.error.issues });
     const guard = readCostGuard(env);
-    const run = await store.createRun(parsed.data.projectId, initialRunState(guard), {
-      command: parsed.data.command, arguments: parsed.data.arguments
+    const run = await store.createRun({
+      projectId: parsed.data.projectId,
+      commandId: null,
+      state: initialRunState(guard),
+      payload: {
+        command: parsed.data.command,
+        arguments: parsed.data.arguments
+      }
     });
     const event = await store.appendEvent({
       runId: run.id,

@@ -10,6 +10,7 @@ import {
   ProjectRegistration,
   ProjectRegistrationResult,
   Run,
+  RunCreateInput,
   RunEvent,
   RunEventInput,
   RunId
@@ -29,7 +30,7 @@ export type StoreTable = keyof typeof TABLE_ORDER;
 
 export interface OrdisStore {
   list(table: StoreTable): Promise<unknown[]>;
-  createRun(projectId: Run["projectId"], state: Run["state"], payload: JsonRecord): Promise<Run>;
+  createRun(input: RunCreateInput): Promise<Run>;
   appendEvent(input: RunEventInput): Promise<RunEvent>;
   heartbeat(heartbeat: NodeHeartbeat): Promise<void>;
   consumeApproval(id: ApprovalRequest["id"]): Promise<boolean>;
@@ -52,15 +53,18 @@ export class PgStore implements OrdisStore {
     const rows = result.rows.map(camel);
     if (table === "projects") return rows.map((row) => Project.parse(row));
     if (table === "nodes") return rows.map((row) => NodeRecord.parse(row));
+    if (table === "runs") return rows.map((row) => Run.parse(row));
     if (table === "approval_requests") return rows.map((row) => ApprovalRequest.parse(row));
     return rows;
   }
-  async createRun(projectId: Run["projectId"], state: Run["state"], payload: JsonRecord) {
+  async createRun(input: RunCreateInput) {
+    const runInput = RunCreateInput.parse(input);
     const result = await this.pool.query(
-      `INSERT INTO runs(project_id,state,payload) VALUES ($1,$2,$3) RETURNING id,project_id,state,assigned_node_id,created_at,updated_at`,
-      [projectId, state, payload]
+      `INSERT INTO runs(project_id,command_id,state,payload) VALUES ($1,$2,$3,$4)
+       RETURNING id,project_id,command_id,state,assigned_node_id,payload,created_at,updated_at`,
+      [runInput.projectId, runInput.commandId, runInput.state, runInput.payload]
     );
-    return camel(result.rows[0]) as Run;
+    return Run.parse(camel(result.rows[0]));
   }
   async appendEvent(input: RunEventInput) {
     const event = RunEventInput.parse(input);
@@ -124,9 +128,16 @@ export class MemoryStore implements OrdisStore {
     if (table === "nodes") return this.nodes;
     throw new Error(`MemoryStore does not implement list(${table})`);
   }
-  async createRun(projectId: Run["projectId"], state: Run["state"], _payload: JsonRecord) {
+  async createRun(input: RunCreateInput) {
+    const runInput = RunCreateInput.parse(input);
     const now = new Date().toISOString();
-    const run = Run.parse({ id: RunId.parse(randomUUID()), projectId, state, assignedNodeId: null, createdAt: now, updatedAt: now });
+    const run = Run.parse({
+      id: RunId.parse(randomUUID()),
+      ...runInput,
+      assignedNodeId: null,
+      createdAt: now,
+      updatedAt: now
+    });
     this.runs.unshift(run);
     return run;
   }
