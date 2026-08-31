@@ -107,6 +107,7 @@ export const RUN_EVENT_TYPES = [
   "run.created",
   "commission.dispatched",
   "commission.claimed",
+  "commission.output",
   "commission.succeeded",
   "commission.failed"
 ] as const;
@@ -122,6 +123,14 @@ export const RunEventInput = RunEvent.pick({
   runId: true,
   type: true,
   payload: true
+});
+export const RunEventListResponse = z.object({ items: z.array(RunEvent) });
+export const CommissionOutputInput = z.object({
+  runId: RunId,
+  nodeId: NodeId,
+  stdout: z.string().max(65_536),
+  stderr: z.string().max(65_536),
+  truncated: z.boolean()
 });
 export const COMMISSION_COMPLETION_STATES = [
   RunState.enum.succeeded,
@@ -231,6 +240,7 @@ export const Report = z.object({
   evidence: z.array(Evidence),
   generatedAt: IsoDate
 });
+export const ReportListResponse = z.object({ items: z.array(Report) });
 
 export const IdeaGraph = z.object({
   id: IdeaGraphId,
@@ -268,6 +278,7 @@ export type RunCreateInput = z.infer<typeof RunCreateInput>;
 export type RunSummary = z.infer<typeof RunSummary>;
 export type RunEvent = z.infer<typeof RunEvent>;
 export type RunEventInput = z.infer<typeof RunEventInput>;
+export type CommissionOutputInput = z.infer<typeof CommissionOutputInput>;
 export type RunEventType = z.infer<typeof RunEventType>;
 export type CommissionClaim = z.infer<typeof CommissionClaim>;
 export type CommissionCompletionInput = z.infer<typeof CommissionCompletionInput>;

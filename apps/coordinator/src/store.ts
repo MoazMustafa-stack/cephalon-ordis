@@ -7,6 +7,7 @@ import {
   CommissionClaim,
   CommissionCompletion,
   CommissionCompletionInput,
+  CommissionOutputInput,
   NodeHeartbeat,
   NodeId,
   NodeRecord,
@@ -19,6 +20,7 @@ import {
   ProjectId,
   ProjectRegistration,
   ProjectRegistrationResult,
+  Report,
   Run,
   RunCreateInput,
   RunEvent,
@@ -51,6 +53,8 @@ export interface OrdisStore {
   list(table: StoreTable): Promise<unknown[]>;
   createRun(input: RunCreateInput): Promise<Run>;
   appendEvent(input: RunEventInput): Promise<RunEvent>;
+  appendCommissionOutput(input: CommissionOutputInput): Promise<RunEvent>;
+  listRunEvents(runId: Run["id"]): Promise<RunEvent[]>;
   heartbeat(heartbeat: NodeHeartbeat): Promise<void>;
   consumeApproval(id: ApprovalRequest["id"]): Promise<boolean>;
   registerProject(input: ProjectRegistration): Promise<ProjectRegistrationResult>;
@@ -58,6 +62,7 @@ export interface OrdisStore {
   dispatchThread(input: DispatchRequest): Promise<DispatchResult>;
   claimCommission(nodeId: NodeHeartbeat["nodeId"]): Promise<CommissionClaim | null>;
   completeCommission(input: CommissionCompletionInput): Promise<CommissionCompletion>;
+  createReport(report: Report): Promise<Report>;
   close(): Promise<void>;
 }
 
@@ -93,6 +98,7 @@ export class PgStore implements OrdisStore {
     if (table === "nodes") return rows.map((row) => NodeRecord.parse(row));
     if (table === "runs") return rows.map((row) => Run.parse(row));
     if (table === "approval_requests") return rows.map((row) => ApprovalRequest.parse(row));
+    if (table === "reports") return rows.map((row) => Report.parse(row.body));
     return rows;
   }
   async createRun(input: RunCreateInput) {
@@ -111,6 +117,25 @@ export class PgStore implements OrdisStore {
       [event.runId, event.type, event.payload]
     );
     return RunEvent.parse(camel(result.rows[0]));
+  }
+  async appendCommissionOutput(input: CommissionOutputInput) {
+    const output = CommissionOutputInput.parse(input);
+    const result = await this.pool.query(
+      `INSERT INTO run_events(run_id,type,payload)
+       SELECT $1,$4,jsonb_build_object('stdout',$5,'stderr',$6,'truncated',$7)
+       WHERE EXISTS (SELECT 1 FROM runs WHERE id=$1 AND assigned_node_id=$2 AND state=$3)
+       RETURNING id,run_id,type,payload,occurred_at`,
+      [output.runId, output.nodeId, RunState.enum.claimed, RunEventType.enum["commission.output"], output.stdout, output.stderr, output.truncated]
+    );
+    if (!result.rows[0]) throw new CommissionTransitionError();
+    return RunEvent.parse(camel(result.rows[0]));
+  }
+  async listRunEvents(runId: Run["id"]) {
+    const result = await this.pool.query(
+      "SELECT id,run_id,type,payload,occurred_at FROM run_events WHERE run_id=$1 ORDER BY id ASC",
+      [RunId.parse(runId)]
+    );
+    return result.rows.map((row) => RunEvent.parse(camel(row)));
   }
   async heartbeat(input: NodeHeartbeat) {
     const h = NodeHeartbeat.parse(input);
@@ -273,6 +298,14 @@ export class PgStore implements OrdisStore {
     const row = result.rows[0] as { run: JsonRecord; event: JsonRecord };
     return CommissionCompletion.parse({ run: camel(row.run), event: camel(row.event) });
   }
+  async createReport(input: Report) {
+    const report = Report.parse(input);
+    const result = await this.pool.query(
+      "INSERT INTO reports(id,project_id,kind,title,body,generated_at) VALUES($1,$2,$3,$4,$5,$6) RETURNING body",
+      [report.id, report.projectId, report.kind, report.title, report, report.generatedAt]
+    );
+    return Report.parse(result.rows[0].body);
+  }
   async close() { await this.pool.end(); }
 }
 
@@ -282,12 +315,14 @@ export class MemoryStore implements OrdisStore {
   private nodes: NodeRecord[] = [];
   private projects: Project[] = [];
   private threads: Thread[] = [];
+  private reports: Report[] = [];
 
   async list(table: StoreTable) {
     if (table === "projects") return this.projects;
     if (table === "threads") return this.threads;
     if (table === "runs") return this.runs;
     if (table === "nodes") return this.nodes;
+    if (table === "reports") return this.reports;
     throw new Error(`MemoryStore does not implement list(${table})`);
   }
   async createRun(input: RunCreateInput) {
@@ -308,6 +343,21 @@ export class MemoryStore implements OrdisStore {
     const event = RunEvent.parse({ id: this.events.length + 1, ...eventInput, occurredAt: new Date().toISOString() });
     this.events.push(event);
     return event;
+  }
+  async appendCommissionOutput(input: CommissionOutputInput) {
+    const output = CommissionOutputInput.parse(input);
+    if (!this.runs.some((run) => run.id === output.runId && run.assignedNodeId === output.nodeId && run.state === RunState.enum.claimed)) {
+      throw new CommissionTransitionError();
+    }
+    return this.appendEvent({
+      runId: output.runId,
+      type: RunEventType.enum["commission.output"],
+      payload: { stdout: output.stdout, stderr: output.stderr, truncated: output.truncated }
+    });
+  }
+  async listRunEvents(runId: Run["id"]) {
+    const id = RunId.parse(runId);
+    return this.events.filter((event) => event.runId === id);
   }
   async heartbeat(input: NodeHeartbeat) {
     const h = NodeHeartbeat.parse(input);
@@ -433,6 +483,11 @@ export class MemoryStore implements OrdisStore {
     this.runs[runIndex] = run;
     this.events.push(event);
     return CommissionCompletion.parse({ run, event });
+  }
+  async createReport(input: Report) {
+    const report = Report.parse(input);
+    this.reports.unshift(report);
+    return report;
   }
   async close() {}
 }

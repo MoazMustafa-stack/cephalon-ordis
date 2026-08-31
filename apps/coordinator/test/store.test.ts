@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
-import { AllowanceState, ChartRequest, CommandId, DispatchRequest, NodeHeartbeat, NodePlatform, ProjectId, RunEventType, RunState, ThreadState } from "@ordis/shared";
+import { AllowanceState, ChartRequest, CommandId, DispatchRequest, NodeHeartbeat, NodePlatform, ProjectId, Report, ReportId, ReportKind, RunEventType, RunState, ThreadState } from "@ordis/shared";
 import { MemoryStore, PgStore, type StoreTable } from "../src/store.js";
 
 describe("store contracts", () => {
@@ -24,7 +24,7 @@ describe("store contracts", () => {
 
   it("throws for unsupported MemoryStore tables", async () => {
     const store = new MemoryStore();
-    await expect(store.list("reports")).rejects.toThrow("does not implement");
+    await expect(store.list("idea_graphs")).rejects.toThrow("does not implement");
   });
 
   it("preserves command ID and payload in PostgreSQL and memory runs", async () => {
@@ -215,5 +215,26 @@ describe("store contracts", () => {
       run: { projectId: project.id, assignedNodeId: nodeId, payload: { threadId: thread.id } },
       event: { type: RunEventType.enum["commission.dispatched"] }
     });
+  });
+
+  it("persists the complete canonical Report document in PostgreSQL and memory", async () => {
+    const report = Report.parse({
+      id: ReportId.parse(randomUUID()),
+      projectId: ProjectId.parse(randomUUID()),
+      kind: ReportKind.enum.validation,
+      title: "Commission Chronicle",
+      summary: "Completed with evidence.",
+      evidence: [],
+      generatedAt: "2026-08-31T00:00:00.000Z"
+    });
+    const query = vi.fn().mockResolvedValue({ rows: [{ body: report }] });
+    const postgres = new PgStore({ query } as never);
+    const memory = new MemoryStore();
+    await expect(postgres.createReport(report)).resolves.toEqual(report);
+    await expect(memory.createReport(report)).resolves.toEqual(report);
+    await expect(memory.list("reports")).resolves.toEqual([report]);
+    expect(query).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO reports"), [
+      report.id, report.projectId, report.kind, report.title, report, report.generatedAt
+    ]);
   });
 });

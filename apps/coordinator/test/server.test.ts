@@ -317,6 +317,13 @@ describe("coordinator", () => {
     });
     const noneLeft = await app.inject({ method: "POST", url: `/api/hands/${nodeId}/claim` });
     expect(noneLeft.statusCode).toBe(204);
+    const output = await app.inject({
+      method: "POST",
+      url: `/api/runs/${claim.json().run.id}/output`,
+      payload: { nodeId, stdout: "local Codex evidence", stderr: "", truncated: false }
+    });
+    expect(output.statusCode).toBe(201);
+    expect(output.json()).toMatchObject({ type: RunEventType.enum["commission.output"] });
 
     const complete = await app.inject({
       method: "POST",
@@ -328,5 +335,18 @@ describe("coordinator", () => {
       run: { state: RunState.enum.succeeded, assignedNodeId: nodeId },
       event: { type: RunEventType.enum["commission.succeeded"], payload: { exitCode: 0 } }
     });
+    const events = await app.inject({ method: "GET", url: `/api/runs/${claim.json().run.id}/events` });
+    expect(events.statusCode).toBe(200);
+    expect(events.json().items.map((event: { type: string }) => event.type)).toEqual([
+      RunEventType.enum["commission.dispatched"],
+      RunEventType.enum["commission.claimed"],
+      RunEventType.enum["commission.output"],
+      RunEventType.enum["commission.succeeded"]
+    ]);
+    const report = await app.inject({ method: "POST", url: `/api/runs/${claim.json().run.id}/report` });
+    expect(report.statusCode).toBe(201);
+    expect(report.json()).toMatchObject({ projectId: project.json().id, evidence: expect.any(Array) });
+    const reports = await app.inject({ method: "GET", url: "/api/reports" });
+    expect(reports.json().items).toHaveLength(1);
   });
 });

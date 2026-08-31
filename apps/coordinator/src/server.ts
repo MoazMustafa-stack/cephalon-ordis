@@ -1,7 +1,8 @@
+import { randomUUID } from "node:crypto";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import websocket from "@fastify/websocket";
-import { ApprovalId, AuthMode, ChartRequest, CommissionCompletionInput, DispatchRequest, NodeHeartbeat, NodeId, NodeRecord, presentNode, ProjectRegistration, RunId, RunRequest } from "@ordis/shared";
+import { ApprovalId, AuthMode, ChartRequest, CommissionCompletionInput, CommissionOutputInput, DispatchRequest, NodeHeartbeat, NodeId, NodeRecord, presentNode, ProjectRegistration, Report, ReportId, ReportKind, Run, RunEventListResponse, RunId, RunRequest } from "@ordis/shared";
 import { initialRunState, readCostGuard } from "./cost-guard.js";
 import { CommissionTransitionError, DispatchUnavailableError, type OrdisStore } from "./store.js";
 
@@ -99,6 +100,43 @@ export function buildServer(store: OrdisStore, env: NodeJS.ProcessEnv = process.
       }
       throw error;
     }
+  });
+  app.get<{ Params: { id: string } }>("/api/runs/:id/events", async (request, reply) => {
+    const runId = RunId.safeParse(request.params.id);
+    if (!runId.success) return reply.code(400).send({ error: "invalid_run_id" });
+    return RunEventListResponse.parse({ items: await store.listRunEvents(runId.data) });
+  });
+  app.post<{ Params: { id: string }; Body: unknown }>("/api/runs/:id/output", async (request, reply) => {
+    const runId = RunId.safeParse(request.params.id);
+    const body = typeof request.body === "object" && request.body !== null ? request.body : {};
+    const output = CommissionOutputInput.safeParse({ ...body, runId: runId.success ? runId.data : request.params.id });
+    if (!runId.success || !output.success) return reply.code(400).send({ error: "invalid_commission_output" });
+    try {
+      const event = await store.appendCommissionOutput(output.data);
+      const wire = JSON.stringify(event);
+      for (const client of clients) if (client.readyState === 1) client.send(wire);
+      return reply.code(201).send(event);
+    } catch (error) {
+      if (error instanceof CommissionTransitionError) return reply.code(409).send({ error: "commission_transition_unavailable" });
+      throw error;
+    }
+  });
+  app.post<{ Params: { id: string } }>("/api/runs/:id/report", async (request, reply) => {
+    const runId = RunId.safeParse(request.params.id);
+    if (!runId.success) return reply.code(400).send({ error: "invalid_run_id" });
+    const run = (await store.list("runs")).map((item) => Run.parse(item)).find((item) => item.id === runId.data);
+    if (!run) return reply.code(404).send({ error: "commission_not_found" });
+    const events = await store.listRunEvents(run.id);
+    const report = await store.createReport(Report.parse({
+      id: ReportId.parse(randomUUID()),
+      projectId: run.projectId,
+      kind: ReportKind.enum.validation,
+      title: `Commission ${run.id.slice(0, 8)} Chronicle`,
+      summary: `Commission is ${run.state}; ${events.length} Chronicle events recorded.`,
+      evidence: events.map((event) => ({ label: event.type, uri: `chronicle://runs/${run.id}/events/${event.id}`, capturedAt: event.occurredAt })),
+      generatedAt: new Date().toISOString()
+    }));
+    return reply.code(201).send(report);
   });
   app.get("/api/artifacts", async () => ({ items: [], root: env.ORDIS_DATA_ROOT ? `${env.ORDIS_DATA_ROOT}\\artifacts` : null }));
   app.get("/api/portfolio/developer", async () => ({ mode: "read-only", items: [] }));

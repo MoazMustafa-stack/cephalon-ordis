@@ -23,6 +23,7 @@ const headers = { "content-type": "application/json", ...(token ? { authorizatio
 const startupRetryBaseMs = 1_000;
 const startupRetryMaxMs = 15_000;
 const commissionPollMs = 5_000;
+const maxChronicleOutputChars = 65_536;
 const executionEnabled = process.env.ORDIS_HAND_EXECUTION_ENABLED === "true";
 let activeRuns = 0;
 let executing = false;
@@ -41,9 +42,23 @@ async function resolveGitWorktree(repositoryPath: string) {
 }
 
 function waitForExit(child: ReturnType<typeof runCodexInWorktree>) {
-  return new Promise<number | null>((resolve, reject) => {
+  let stdout = "";
+  let stderr = "";
+  let truncated = false;
+  const collect = (chunk: Buffer | string, stream: "stdout" | "stderr") => {
+    const value = chunk.toString();
+    const current = stream === "stdout" ? stdout : stderr;
+    const remaining = maxChronicleOutputChars - current.length;
+    if (remaining <= 0) { truncated = true; return; }
+    const next = current + value.slice(0, remaining);
+    if (value.length > remaining) truncated = true;
+    if (stream === "stdout") stdout = next; else stderr = next;
+  };
+  child.stdout?.on("data", (chunk) => collect(chunk, "stdout"));
+  child.stderr?.on("data", (chunk) => collect(chunk, "stderr"));
+  return new Promise<{ exitCode: number | null; stdout: string; stderr: string; truncated: boolean }>((resolve, reject) => {
     child.once("error", reject);
-    child.once("close", (code) => resolve(code));
+    child.once("close", (exitCode) => resolve({ exitCode, stdout, stderr, truncated }));
   });
 }
 
@@ -86,6 +101,13 @@ async function completeClaim(claim: CommissionClaim, state: RunState, exitCode: 
   CommissionCompletion.parse(await response.json());
 }
 
+async function recordOutput(claim: CommissionClaim, stdout: string, stderr: string, truncated: boolean) {
+  const response = await fetch(`${coordinator}/api/runs/${claim.run.id}/output`, {
+    method: "POST", headers, body: JSON.stringify({ nodeId, stdout, stderr, truncated })
+  });
+  if (!response.ok) throw new Error(`commission output failed: ${response.status}`);
+}
+
 async function pollCommission() {
   if (!executionEnabled || executing) return;
   const response = await fetch(`${coordinator}/api/hands/${nodeId}/claim`, { method: "POST", headers });
@@ -100,8 +122,9 @@ async function pollCommission() {
   try {
     const worktree = await resolveGitWorktree(claim.project.repositoryPath);
     console.log(`Executing Commission ${claim.run.id} in ${worktree}`);
-    const exitCode = await waitForExit(runCodexInWorktree(payload.objective, worktree));
-    await completeClaim(claim, exitCode === 0 ? RunState.enum.succeeded : RunState.enum.failed, exitCode);
+    const result = await waitForExit(runCodexInWorktree(payload.objective, worktree));
+    await recordOutput(claim, result.stdout, result.stderr, result.truncated);
+    await completeClaim(claim, result.exitCode === 0 ? RunState.enum.succeeded : RunState.enum.failed, result.exitCode);
   } catch (error) {
     console.error(`Commission ${claim.run.id} failed`, error);
     try {
