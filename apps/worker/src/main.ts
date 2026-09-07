@@ -1,13 +1,17 @@
 import { execFile, spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { platform } from "node:os";
 import { promisify } from "node:util";
 import {
   AllowanceState,
+  ArtifactKind,
   CommissionClaim,
   CommissionCompletion,
+  CommissionLeaseRenewal,
+  COMMISSION_LEASE_DURATION_MS,
   DispatchRunPayload,
+  MAX_ARTIFACT_BODY_CHARS,
   NodeHeartbeat,
   NodeId,
   NodePlatform,
@@ -108,6 +112,42 @@ async function recordOutput(claim: CommissionClaim, stdout: string, stderr: stri
   if (!response.ok) throw new Error(`commission output failed: ${response.status}`);
 }
 
+async function renewLease(claim: CommissionClaim) {
+  const response = await fetch(`${coordinator}/api/runs/${claim.run.id}/lease`, {
+    method: "POST", headers, body: JSON.stringify({ nodeId })
+  });
+  if (!response.ok) throw new Error(`commission lease renewal failed: ${response.status}`);
+  CommissionLeaseRenewal.parse(await response.json());
+}
+
+async function recordWorkpiece(claim: CommissionClaim, worktree: string) {
+  let body: string;
+  try {
+    const [{ stdout: status }, { stdout: patch }] = await Promise.all([
+      execFileAsync("git", ["-C", worktree, "status", "--short"]),
+      execFileAsync("git", ["-C", worktree, "diff", "--binary", "--no-ext-diff"], {
+        maxBuffer: MAX_ARTIFACT_BODY_CHARS - 4096
+      })
+    ]);
+    body = JSON.stringify({ status: status.trimEnd(), patch }, null, 2);
+  } catch (error) {
+    body = JSON.stringify({ capture: "unavailable", reason: error instanceof Error ? error.message : String(error) });
+  }
+  const response = await fetch(`${coordinator}/api/runs/${claim.run.id}/artifacts`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      nodeId,
+      kind: ArtifactKind.enum.workpiece,
+      label: "Git workpiece snapshot",
+      mediaType: "application/json",
+      body,
+      sha256: createHash("sha256").update(body).digest("hex")
+    })
+  });
+  if (!response.ok) throw new Error(`commission artifact failed: ${response.status}`);
+}
+
 async function pollCommission() {
   if (!executionEnabled || executing) return;
   const response = await fetch(`${coordinator}/api/hands/${nodeId}/claim`, { method: "POST", headers });
@@ -118,12 +158,17 @@ async function pollCommission() {
   const payload = DispatchRunPayload.parse(claim.run.payload);
   executing = true;
   activeRuns = 1;
+  let leaseTimer: ReturnType<typeof setInterval> | undefined;
   await heartbeat();
   try {
     const worktree = await resolveGitWorktree(claim.project.repositoryPath);
     console.log(`Executing Commission ${claim.run.id} in ${worktree}`);
+    leaseTimer = setInterval(() => renewLease(claim).catch((error) => console.error(error)), Math.floor(COMMISSION_LEASE_DURATION_MS / 3));
     const result = await waitForExit(runCodexInWorktree(payload.objective, worktree));
+    clearInterval(leaseTimer);
+    leaseTimer = undefined;
     await recordOutput(claim, result.stdout, result.stderr, result.truncated);
+    await recordWorkpiece(claim, worktree);
     await completeClaim(claim, result.exitCode === 0 ? RunState.enum.succeeded : RunState.enum.failed, result.exitCode);
   } catch (error) {
     console.error(`Commission ${claim.run.id} failed`, error);
@@ -133,6 +178,7 @@ async function pollCommission() {
       console.error(`Unable to record failure for Commission ${claim.run.id}`, completionError);
     }
   } finally {
+    if (leaseTimer) clearInterval(leaseTimer);
     activeRuns = 0;
     executing = false;
     await heartbeat();

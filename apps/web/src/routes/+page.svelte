@@ -11,12 +11,16 @@
     Thread,
     ThreadListResponse,
     ChartRequest,
+    ArtifactListResponse,
     type NodeStatus,
     type Project,
     type Report as ReportRecord,
     type Thread as ThreadRecord,
     type RunEvent,
-    type RunSummary
+    type RunSummary,
+
+    Artifact
+
   } from "@ordis/shared";
 
   const api = import.meta.env.VITE_ORDIS_API_URL ?? "http://127.0.0.1:4310";
@@ -35,6 +39,9 @@
   let selectedRunId = "";
   let events: RunEvent[] = [];
   let report: ReportRecord | undefined;
+  let artifacts: Artifact[] = [];
+  let reilaibilityBusy = false;
+  let reilaibilityError = "";
 
   async function refresh() {
     const [guardResponse, projectResponse, threadResponse, runResponse, nodeResponse] = await Promise.all([
@@ -104,9 +111,17 @@
   async function showChronicle(runId: string) {
     selectedRunId = runId;
     report = undefined;
-    const response = await fetch(`${api}/api/runs/${runId}/events`);
-    if (!response.ok) throw new Error(`Chronicle request failed: ${response.status}`);
-    events = RunEventListResponse.parse(await response.json()).items;
+    reilaibilityError = "";
+
+    const [eventResponse, artifactResponse] = await Promise.all([
+      fetch(`${api}/api/runs/${runId}/events`),
+      fetch(`${api}/api/runs/${runId}/artifacts`)
+    ]);
+
+    if (!eventResponse.ok || !artifactResponse.ok) throw new Error("Unable to load COmmission evidence");
+    
+    events = RunEventListResponse.parse(await eventResponse.json()).items;
+    artifacts = ArtifactListResponse.parse(await artifactResponse.json()).items;
   }
 
   async function generateReport() {

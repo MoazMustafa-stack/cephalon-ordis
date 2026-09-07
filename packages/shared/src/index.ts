@@ -2,6 +2,7 @@ import { z } from "zod";
 
 export const Id = z.string().uuid();
 export const IsoDate = z.string().datetime();
+export const ArtifactId = Id.brand<"ArtifactId">();
 export const ProjectId = Id.brand<"ProjectId">();
 export const RunId = Id.brand<"RunId">();
 export const NodeId = Id.brand<"NodeId">();
@@ -88,6 +89,9 @@ export const Run = z.object({
   state: RunState,
   assignedNodeId: NodeId.nullable().default(null),
   payload: z.record(z.string(), z.unknown()).default({}),
+  leaseExpiresAt: IsoDate.nullable().default(null),
+  attempt: z.number().int().nonnegative().default(0),
+  maxAttempts: z.number().int().positive().default(3),
   createdAt: IsoDate,
   updatedAt: IsoDate
 });
@@ -100,7 +104,12 @@ export const RunCreateInput = Run.pick({
 export const RunSummary = Run.pick({
   id: true,
   state: true,
-  createdAt: true
+  assignedNodeId: true,
+  leaseExpiresAt: true,
+  attempt: true,
+  maxAttempts: true,
+  createdAt: true,
+  updatedAt: true
 });
 
 export const RUN_EVENT_TYPES = [
@@ -108,6 +117,10 @@ export const RUN_EVENT_TYPES = [
   "commission.dispatched",
   "commission.claimed",
   "commission.output",
+  "commission.artifact",
+  "commission.lease_expired",
+  "commission.retried",
+  "commission.cancelled",
   "commission.succeeded",
   "commission.failed"
 ] as const;
@@ -131,6 +144,51 @@ export const CommissionOutputInput = z.object({
   stdout: z.string().max(65_536),
   stderr: z.string().max(65_536),
   truncated: z.boolean()
+});
+export const COMMISSION_LEASE_DURATION_MS = 60_000;
+export const CommissionLeaseRenewalInput = z.object({
+  runId: RunId,
+  nodeId: NodeId
+});
+export const CommissionLeaseRenewal = z.object({ run: Run });
+export const CommissionCancellationInput = z.object({
+  runId: RunId,
+  reason: z.string().trim().min(1).max(500)
+});
+export const CommissionCancellation = z.object({
+  run: Run,
+  event: RunEvent
+});
+export const CommissionRetryInput = z.object({ runId: RunId });
+export const CommissionRetry = z.object({
+  run: Run,
+  event: RunEvent
+});
+export const ARTIFACT_KINDS = ["workpiece", "execution"] as const;
+export const ArtifactKind = z.enum(ARTIFACT_KINDS);
+export const MAX_ARTIFACT_BODY_CHARS = 1_048_576;
+export const Artifact = z.object({
+  id: ArtifactId,
+  runId: RunId,
+  kind: ArtifactKind,
+  label: z.string().trim().min(1).max(200),
+  mediaType: z.string().trim().min(1).max(100),
+  body: z.string().max(MAX_ARTIFACT_BODY_CHARS),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  createdAt: IsoDate
+});
+export const ArtifactInput = Artifact.pick({
+  runId: true,
+  kind: true,
+  label: true,
+  mediaType: true,
+  body: true,
+  sha256: true
+}).extend({ nodeId: NodeId });
+export const ArtifactListResponse = z.object({ items: z.array(Artifact) });
+export const ArtifactReceipt = z.object({
+  artifact: Artifact,
+  event: RunEvent
 });
 export const COMMISSION_COMPLETION_STATES = [
   RunState.enum.succeeded,
@@ -279,6 +337,15 @@ export type RunSummary = z.infer<typeof RunSummary>;
 export type RunEvent = z.infer<typeof RunEvent>;
 export type RunEventInput = z.infer<typeof RunEventInput>;
 export type CommissionOutputInput = z.infer<typeof CommissionOutputInput>;
+export type CommissionLeaseRenewalInput = z.infer<typeof CommissionLeaseRenewalInput>;
+export type CommissionLeaseRenewal = z.infer<typeof CommissionLeaseRenewal>;
+export type CommissionCancellationInput = z.infer<typeof CommissionCancellationInput>;
+export type CommissionCancellation = z.infer<typeof CommissionCancellation>;
+export type CommissionRetryInput = z.infer<typeof CommissionRetryInput>;
+export type CommissionRetry = z.infer<typeof CommissionRetry>;
+export type Artifact = z.infer<typeof Artifact>;
+export type ArtifactInput = z.infer<typeof ArtifactInput>;
+export type ArtifactReceipt = z.infer<typeof ArtifactReceipt>;
 export type RunEventType = z.infer<typeof RunEventType>;
 export type CommissionClaim = z.infer<typeof CommissionClaim>;
 export type CommissionCompletionInput = z.infer<typeof CommissionCompletionInput>;

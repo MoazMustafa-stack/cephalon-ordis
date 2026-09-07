@@ -1,7 +1,32 @@
 import { describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
-import { AllowanceState, ChartRequest, CommandId, DispatchRequest, NodeHeartbeat, NodePlatform, ProjectId, Report, ReportId, ReportKind, RunEventType, RunState, ThreadState } from "@ordis/shared";
+import { AllowanceState, ChartRequest, CommandId, DispatchRequest, NodeHeartbeat, NodeId, NodePlatform, ProjectId, Report, ReportId, ReportKind, RunEventType, RunState, ThreadState } from "@ordis/shared";
 import { MemoryStore, PgStore, type StoreTable } from "../src/store.js";
+
+async function prepareMemoryCommission() {
+  const store = new MemoryStore();
+  const projectResult = await store.registerProject({
+    name: "Reliability test",
+    repositoryPath: "E:/Cephalon-Ordis/reliability-test"
+  });
+  const thread = await store.createThread({
+    projectId: projectResult.project.id,
+    objective: "Exercise reliability transitions"
+  });
+  const nodeId = NodeId.parse(randomUUID());
+  await store.heartbeat({
+    nodeId,
+    platform: NodePlatform.enum.windows,
+    capabilities: ["codex-cli"],
+    activeRuns: 0,
+    allowance: AllowanceState.enum.available,
+    observedAt: new Date().toISOString()
+  });
+  await store.dispatchThread({ threadId: thread.id });
+  const claim = await store.claimCommission(nodeId);
+  if (!claim) throw new Error("test commission was not claimed");
+  return { store, nodeId, run: claim.run };
+}
 
 describe("store contracts", () => {
   it.each([
@@ -215,6 +240,143 @@ describe("store contracts", () => {
       run: { projectId: project.id, assignedNodeId: nodeId, payload: { threadId: thread.id } },
       event: { type: RunEventType.enum["commission.dispatched"] }
     });
+  });
+
+  it("recovers an expired claim and preserves the same lease-expiry contract in PostgreSQL", async () => {
+    const { store, nodeId, run } = await prepareMemoryCommission();
+    const internal = store as unknown as { runs: Array<{ leaseExpiresAt: string | null }> };
+    internal.runs[0].leaseExpiresAt = new Date(Date.now() - 1).toISOString();
+
+    const recovered = await store.claimCommission(nodeId);
+    expect(recovered?.run).toMatchObject({
+      id: run.id,
+      state: RunState.enum.claimed,
+      assignedNodeId: nodeId,
+      attempt: 2,
+      maxAttempts: 3
+    });
+    const memoryEvents = await store.listRunEvents(run.id);
+    expect(memoryEvents.map((event) => event.type)).toContain(RunEventType.enum["commission.lease_expired"]);
+
+    const createdAt = "2026-08-31T00:00:00.000Z";
+    const pgQuery = vi.fn().mockResolvedValue({
+      rows: [{
+        run: {
+          id: run.id,
+          project_id: run.projectId,
+          command_id: null,
+          state: RunState.enum.claimed,
+          assigned_node_id: nodeId,
+          payload: run.payload,
+          lease_expires_at: "2026-08-31T00:01:00.000Z",
+          attempt: 2,
+          max_attempts: 3,
+          created_at: createdAt,
+          updated_at: createdAt
+        },
+        project: {
+          id: run.projectId,
+          name: "Reliability test",
+          repository_path: "E:/Cephalon-Ordis/reliability-test",
+          created_at: createdAt
+        },
+        event: {
+          id: 99,
+          run_id: run.id,
+          type: RunEventType.enum["commission.claimed"],
+          payload: { nodeId, attempt: 2 },
+          occurred_at: createdAt
+        }
+      }]
+    });
+    const postgres = new PgStore({ query: pgQuery } as never);
+    await postgres.claimCommission(nodeId);
+    expect(pgQuery.mock.calls[0]?.[0]).toContain("lease_expires_at<=now()");
+    expect(pgQuery.mock.calls[0]?.[1]).toContain(RunEventType.enum["commission.lease_expired"]);
+  });
+
+  it("cancels active work in memory and PostgreSQL with the same terminal event", async () => {
+    const { store, nodeId, run } = await prepareMemoryCommission();
+    const memoryResult = await store.cancelCommission({ runId: run.id, reason: "operator stop" });
+    expect(memoryResult).toMatchObject({
+      run: { state: RunState.enum.cancelled, leaseExpiresAt: null },
+      event: { type: RunEventType.enum["commission.cancelled"] }
+    });
+
+    const createdAt = "2026-08-31T00:00:00.000Z";
+    const query = vi.fn().mockResolvedValue({
+      rows: [{
+        run: {
+          id: run.id,
+          project_id: run.projectId,
+          command_id: null,
+          state: RunState.enum.cancelled,
+          assigned_node_id: nodeId,
+          payload: run.payload,
+          lease_expires_at: null,
+          attempt: 1,
+          max_attempts: 3,
+          created_at: createdAt,
+          updated_at: createdAt
+        },
+        event: {
+          id: 100,
+          run_id: run.id,
+          type: RunEventType.enum["commission.cancelled"],
+          payload: { reason: "operator stop" },
+          occurred_at: createdAt
+        }
+      }]
+    });
+    const postgres = new PgStore({ query } as never);
+    const postgresResult = await postgres.cancelCommission({ runId: run.id, reason: "operator stop" });
+    expect(postgresResult).toMatchObject({
+      run: { state: RunState.enum.cancelled, leaseExpiresAt: null },
+      event: { type: RunEventType.enum["commission.cancelled"] }
+    });
+  });
+
+  it("requeues failed work for another attempt in memory and PostgreSQL", async () => {
+    const { store, nodeId, run } = await prepareMemoryCommission();
+    await store.completeCommission({ runId: run.id, nodeId, state: RunState.enum.failed, exitCode: 1 });
+    const memoryResult = await store.retryCommission({ runId: run.id });
+    expect(memoryResult).toMatchObject({
+      run: { state: RunState.enum.queued, assignedNodeId: null, attempt: 1, maxAttempts: 3 },
+      event: { type: RunEventType.enum["commission.retried"] }
+    });
+
+    const createdAt = "2026-08-31T00:00:00.000Z";
+    const query = vi.fn().mockResolvedValue({
+      rows: [{
+        run: {
+          id: run.id,
+          project_id: run.projectId,
+          command_id: null,
+          state: RunState.enum.queued,
+          assigned_node_id: null,
+          payload: run.payload,
+          lease_expires_at: null,
+          attempt: 1,
+          max_attempts: 3,
+          created_at: createdAt,
+          updated_at: createdAt
+        },
+        event: {
+          id: 101,
+          run_id: run.id,
+          type: RunEventType.enum["commission.retried"],
+          payload: { attempt: 1, maxAttempts: 3 },
+          occurred_at: createdAt
+        }
+      }]
+    });
+    const postgres = new PgStore({ query } as never);
+    const postgresResult = await postgres.retryCommission({ runId: run.id });
+    expect(postgresResult).toMatchObject({
+      run: { state: RunState.enum.queued, assignedNodeId: null, attempt: 1 },
+      event: { type: RunEventType.enum["commission.retried"] }
+    });
+    expect(query.mock.calls[0]?.[0]).toContain("attempt < max_attempts");
   });
 
   it("persists the complete canonical Report document in PostgreSQL and memory", async () => {

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import websocket from "@fastify/websocket";
-import { ApprovalId, AuthMode, ChartRequest, CommissionCompletionInput, CommissionOutputInput, DispatchRequest, NodeHeartbeat, NodeId, NodeRecord, presentNode, ProjectRegistration, Report, ReportId, ReportKind, Run, RunEventListResponse, RunId, RunRequest } from "@ordis/shared";
+import { ApprovalId, ArtifactInput, ArtifactListResponse, AuthMode, ChartRequest, CommissionCancellationInput, CommissionCompletionInput, CommissionLeaseRenewalInput, CommissionOutputInput, CommissionRetryInput, DispatchRequest, NodeHeartbeat, NodeId, NodeRecord, presentNode, ProjectRegistration, Report, ReportId, ReportKind, Run, RunEventListResponse, RunId, RunRequest } from "@ordis/shared";
 import { initialRunState, readCostGuard } from "./cost-guard.js";
 import { CommissionTransitionError, DispatchUnavailableError, type OrdisStore } from "./store.js";
 
@@ -106,6 +106,38 @@ export function buildServer(store: OrdisStore, env: NodeJS.ProcessEnv = process.
     if (!runId.success) return reply.code(400).send({ error: "invalid_run_id" });
     return RunEventListResponse.parse({ items: await store.listRunEvents(runId.data) });
   });
+  app.get<{ Params: { id: string } }>("/api/runs/:id/artifacts", async (request, reply) => {
+    const runId = RunId.safeParse(request.params.id);
+    if (!runId.success) return reply.code(400).send({ error: "invalid_run_id" });
+    return ArtifactListResponse.parse({ items: await store.listRunArtifacts(runId.data) });
+  });
+  app.post<{ Params: { id: string }; Body: unknown }>("/api/runs/:id/artifacts", async (request, reply) => {
+    const runId = RunId.safeParse(request.params.id);
+    const body = typeof request.body === "object" && request.body !== null ? request.body : {};
+    const artifact = ArtifactInput.safeParse({ ...body, runId: runId.success ? runId.data : request.params.id });
+    if (!runId.success || !artifact.success) return reply.code(400).send({ error: "invalid_artifact" });
+    try {
+      const receipt = await store.createArtifact(artifact.data);
+      const wire = JSON.stringify(receipt.event);
+      for (const client of clients) if (client.readyState === 1) client.send(wire);
+      return reply.code(201).send(receipt.artifact);
+    } catch (error) {
+      if (error instanceof CommissionTransitionError) return reply.code(409).send({ error: "commission_transition_unavailable" });
+      throw error;
+    }
+  });
+  app.post<{ Params: { id: string }; Body: unknown }>("/api/runs/:id/lease", async (request, reply) => {
+    const runId = RunId.safeParse(request.params.id);
+    const body = typeof request.body === "object" && request.body !== null ? request.body : {};
+    const renewal = CommissionLeaseRenewalInput.safeParse({ ...body, runId: runId.success ? runId.data : request.params.id });
+    if (!runId.success || !renewal.success) return reply.code(400).send({ error: "invalid_commission_lease" });
+    try {
+      return reply.code(200).send(await store.renewCommissionLease(renewal.data));
+    } catch (error) {
+      if (error instanceof CommissionTransitionError) return reply.code(409).send({ error: "commission_transition_unavailable" });
+      throw error;
+    }
+  });
   app.post<{ Params: { id: string }; Body: unknown }>("/api/runs/:id/output", async (request, reply) => {
     const runId = RunId.safeParse(request.params.id);
     const body = typeof request.body === "object" && request.body !== null ? request.body : {};
@@ -116,6 +148,34 @@ export function buildServer(store: OrdisStore, env: NodeJS.ProcessEnv = process.
       const wire = JSON.stringify(event);
       for (const client of clients) if (client.readyState === 1) client.send(wire);
       return reply.code(201).send(event);
+    } catch (error) {
+      if (error instanceof CommissionTransitionError) return reply.code(409).send({ error: "commission_transition_unavailable" });
+      throw error;
+    }
+  });
+  app.post<{ Params: { id: string }; Body: unknown }>("/api/runs/:id/cancel", async (request, reply) => {
+    const runId = RunId.safeParse(request.params.id);
+    const body = typeof request.body === "object" && request.body !== null ? request.body : {};
+    const cancellation = CommissionCancellationInput.safeParse({ ...body, runId: runId.success ? runId.data : request.params.id });
+    if (!runId.success || !cancellation.success) return reply.code(400).send({ error: "invalid_commission_cancellation" });
+    try {
+      const result = await store.cancelCommission(cancellation.data);
+      const wire = JSON.stringify(result.event);
+      for (const client of clients) if (client.readyState === 1) client.send(wire);
+      return reply.code(200).send(result);
+    } catch (error) {
+      if (error instanceof CommissionTransitionError) return reply.code(409).send({ error: "commission_transition_unavailable" });
+      throw error;
+    }
+  });
+  app.post<{ Params: { id: string } }>("/api/runs/:id/retry", async (request, reply) => {
+    const retry = CommissionRetryInput.safeParse({ runId: request.params.id });
+    if (!retry.success) return reply.code(400).send({ error: "invalid_commission_retry" });
+    try {
+      const result = await store.retryCommission(retry.data);
+      const wire = JSON.stringify(result.event);
+      for (const client of clients) if (client.readyState === 1) client.send(wire);
+      return reply.code(200).send(result);
     } catch (error) {
       if (error instanceof CommissionTransitionError) return reply.code(409).send({ error: "commission_transition_unavailable" });
       throw error;

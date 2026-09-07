@@ -1,13 +1,24 @@
 import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
 import {
+  Artifact,
+  ArtifactId,
+  ArtifactInput,
+  ArtifactReceipt,
   ApprovalRequest,
   ApprovalStatus,
   ACTIVE_ASSIGNMENT_RUN_STATES,
   CommissionClaim,
   CommissionCompletion,
   CommissionCompletionInput,
+  CommissionCancellation,
+  CommissionCancellationInput,
   CommissionOutputInput,
+  CommissionLeaseRenewal,
+  CommissionLeaseRenewalInput,
+  CommissionRetry,
+  CommissionRetryInput,
+  COMMISSION_LEASE_DURATION_MS,
   NodeHeartbeat,
   NodeId,
   NodeRecord,
@@ -38,6 +49,7 @@ import {
 
 export type JsonRecord = Record<string, unknown>;
 const TABLE_ORDER = {
+  artifacts: "created_at",
   projects: "created_at",
   threads: "created_at",
   nodes: "last_seen_at",
@@ -48,12 +60,15 @@ const TABLE_ORDER = {
   portfolio_transactions: "occurred_on"
 } as const;
 export type StoreTable = keyof typeof TABLE_ORDER;
+const RUN_COLUMNS = "id,project_id,command_id,state,assigned_node_id,payload,lease_expires_at,attempt,max_attempts,created_at,updated_at";
 
 export interface OrdisStore {
   list(table: StoreTable): Promise<unknown[]>;
   createRun(input: RunCreateInput): Promise<Run>;
   appendEvent(input: RunEventInput): Promise<RunEvent>;
   appendCommissionOutput(input: CommissionOutputInput): Promise<RunEvent>;
+  createArtifact(input: ArtifactInput): Promise<ArtifactReceipt>;
+  listRunArtifacts(runId: Run["id"]): Promise<Artifact[]>;
   listRunEvents(runId: Run["id"]): Promise<RunEvent[]>;
   heartbeat(heartbeat: NodeHeartbeat): Promise<void>;
   consumeApproval(id: ApprovalRequest["id"]): Promise<boolean>;
@@ -61,7 +76,10 @@ export interface OrdisStore {
   createThread(input: ChartRequest): Promise<Thread>;
   dispatchThread(input: DispatchRequest): Promise<DispatchResult>;
   claimCommission(nodeId: NodeHeartbeat["nodeId"]): Promise<CommissionClaim | null>;
+  renewCommissionLease(input: CommissionLeaseRenewalInput): Promise<CommissionLeaseRenewal>;
   completeCommission(input: CommissionCompletionInput): Promise<CommissionCompletion>;
+  cancelCommission(input: CommissionCancellationInput): Promise<CommissionCancellation>;
+  retryCommission(input: CommissionRetryInput): Promise<CommissionRetry>;
   createReport(report: Report): Promise<Report>;
   close(): Promise<void>;
 }
@@ -97,6 +115,7 @@ export class PgStore implements OrdisStore {
     if (table === "threads") return rows.map((row) => Thread.parse(row));
     if (table === "nodes") return rows.map((row) => NodeRecord.parse(row));
     if (table === "runs") return rows.map((row) => Run.parse(row));
+    if (table === "artifacts") return rows.map((row) => Artifact.parse(row));
     if (table === "approval_requests") return rows.map((row) => ApprovalRequest.parse(row));
     if (table === "reports") return rows.map((row) => Report.parse(row.body));
     return rows;
@@ -105,7 +124,7 @@ export class PgStore implements OrdisStore {
     const runInput = RunCreateInput.parse(input);
     const result = await this.pool.query(
       `INSERT INTO runs(project_id,command_id,state,payload) VALUES ($1,$2,$3,$4)
-       RETURNING id,project_id,command_id,state,assigned_node_id,payload,created_at,updated_at`,
+       RETURNING ${RUN_COLUMNS}`,
       [runInput.projectId, runInput.commandId, runInput.state, runInput.payload]
     );
     return Run.parse(camel(result.rows[0]));
@@ -123,12 +142,48 @@ export class PgStore implements OrdisStore {
     const result = await this.pool.query(
       `INSERT INTO run_events(run_id,type,payload)
        SELECT $1,$4,jsonb_build_object('stdout',$5,'stderr',$6,'truncated',$7)
-       WHERE EXISTS (SELECT 1 FROM runs WHERE id=$1 AND assigned_node_id=$2 AND state=$3)
+       WHERE EXISTS (SELECT 1 FROM runs WHERE id=$1 AND assigned_node_id=$2 AND state=$3 AND lease_expires_at>now())
        RETURNING id,run_id,type,payload,occurred_at`,
       [output.runId, output.nodeId, RunState.enum.claimed, RunEventType.enum["commission.output"], output.stdout, output.stderr, output.truncated]
     );
     if (!result.rows[0]) throw new CommissionTransitionError();
     return RunEvent.parse(camel(result.rows[0]));
+  }
+  async createArtifact(input: ArtifactInput) {
+    const artifact = ArtifactInput.parse(input);
+    const result = await this.pool.query(
+      `WITH permitted_run AS (
+         SELECT id FROM runs WHERE id=$1 AND assigned_node_id=$2 AND state=$3 AND lease_expires_at>now()
+       ), created_artifact AS (
+         INSERT INTO artifacts(id,run_id,kind,label,media_type,body,sha256)
+         SELECT $4,$1,$5,$6,$7,$8,$9 FROM permitted_run
+         RETURNING id,run_id,kind,label,media_type,body,sha256,created_at
+       ), created_event AS (
+         INSERT INTO run_events(run_id,type,payload)
+         SELECT created_artifact.run_id,$10,jsonb_build_object(
+           'artifactId',created_artifact.id,'kind',created_artifact.kind,
+           'label',created_artifact.label,'sha256',created_artifact.sha256
+         ) FROM created_artifact
+         RETURNING id,run_id,type,payload,occurred_at
+       )
+       SELECT row_to_json(created_artifact) AS artifact,row_to_json(created_event) AS event
+       FROM created_artifact CROSS JOIN created_event`,
+      [
+        artifact.runId, artifact.nodeId, RunState.enum.claimed, randomUUID(), artifact.kind,
+        artifact.label, artifact.mediaType, artifact.body, artifact.sha256,
+        RunEventType.enum["commission.artifact"]
+      ]
+    );
+    if (!result.rows[0]) throw new CommissionTransitionError();
+    const row = result.rows[0] as { artifact: JsonRecord; event: JsonRecord };
+    return ArtifactReceipt.parse({ artifact: camel(row.artifact), event: camel(row.event) });
+  }
+  async listRunArtifacts(runId: Run["id"]) {
+    const result = await this.pool.query(
+      "SELECT id,run_id,kind,label,media_type,body,sha256,created_at FROM artifacts WHERE run_id=$1 ORDER BY created_at ASC,id ASC",
+      [RunId.parse(runId)]
+    );
+    return result.rows.map((row) => Artifact.parse(camel(row)));
   }
   async listRunEvents(runId: Run["id"]) {
     const result = await this.pool.query(
@@ -248,31 +303,103 @@ export class PgStore implements OrdisStore {
   async claimCommission(nodeId: NodeHeartbeat["nodeId"]) {
     const handId = NodeId.parse(nodeId);
     const result = await this.pool.query(
-      `WITH selected_run AS (
+      `WITH recovered_runs AS (
+         UPDATE runs SET state=CASE WHEN attempt < max_attempts THEN $2 ELSE $4 END,
+           assigned_node_id=NULL, lease_expires_at=NULL, updated_at=now()
+         WHERE state=$3 AND lease_expires_at<=now()
+         RETURNING id,state,attempt,max_attempts
+       ), recovered_events AS (
+         INSERT INTO run_events(run_id,type,payload)
+         SELECT id,$5,jsonb_build_object('state',state,'attempt',attempt,'maxAttempts',max_attempts)
+         FROM recovered_runs
+       ), selected_run AS (
          SELECT id FROM runs
-         WHERE assigned_node_id=$1 AND state=$2
-         ORDER BY created_at ASC
+         WHERE state=$2 AND attempt < max_attempts AND (assigned_node_id=$1 OR assigned_node_id IS NULL)
+           AND EXISTS (SELECT 1 FROM nodes WHERE id=$1 AND last_seen_at >= $6)
+         ORDER BY CASE WHEN assigned_node_id=$1 THEN 0 ELSE 1 END, created_at ASC
          LIMIT 1 FOR UPDATE SKIP LOCKED
        ), claimed_run AS (
-         UPDATE runs SET state=$3, updated_at=now()
+         UPDATE runs SET state=$8, assigned_node_id=$1, attempt=attempt+1,
+           lease_expires_at=now() + ($7 * interval '1 millisecond'), updated_at=now()
          FROM selected_run WHERE runs.id=selected_run.id
-         RETURNING runs.id, runs.project_id, runs.command_id, runs.state, runs.assigned_node_id, runs.payload, runs.created_at, runs.updated_at
+         RETURNING runs.id,runs.project_id,runs.command_id,runs.state,runs.assigned_node_id,runs.payload,
+           runs.lease_expires_at,runs.attempt,runs.max_attempts,runs.created_at,runs.updated_at
        ), created_event AS (
          INSERT INTO run_events(run_id,type,payload)
-         SELECT claimed_run.id, $4, jsonb_build_object('nodeId', $1, 'state', claimed_run.state)
+         SELECT claimed_run.id,$9,jsonb_build_object('nodeId',$1,'state',claimed_run.state,
+           'attempt',claimed_run.attempt,'leaseExpiresAt',claimed_run.lease_expires_at)
          FROM claimed_run
-         RETURNING id, run_id, type, payload, occurred_at
+         RETURNING id,run_id,type,payload,occurred_at
        )
        SELECT row_to_json(claimed_run) AS run, row_to_json(projects) AS project,
               row_to_json(created_event) AS event
        FROM claimed_run
        JOIN projects ON projects.id=claimed_run.project_id
        CROSS JOIN created_event`,
-      [handId, RunState.enum.queued, RunState.enum.claimed, RunEventType.enum["commission.claimed"]]
+      [
+        handId, RunState.enum.queued, RunState.enum.claimed, RunState.enum.failed,
+        RunEventType.enum["commission.lease_expired"], nodeFreshnessCutoff(), COMMISSION_LEASE_DURATION_MS,
+        RunState.enum.claimed, RunEventType.enum["commission.claimed"]
+      ]
     );
     if (!result.rows[0]) return null;
     const row = result.rows[0] as { run: JsonRecord; project: JsonRecord; event: JsonRecord };
     return CommissionClaim.parse({ run: camel(row.run), project: camel(row.project), event: camel(row.event) });
+  }
+  async renewCommissionLease(input: CommissionLeaseRenewalInput) {
+    const renewal = CommissionLeaseRenewalInput.parse(input);
+    const result = await this.pool.query(
+      `UPDATE runs SET lease_expires_at=now() + ($3 * interval '1 millisecond'), updated_at=now()
+       WHERE id=$1 AND assigned_node_id=$2 AND state=$4 AND lease_expires_at>now()
+       RETURNING ${RUN_COLUMNS}`,
+      [renewal.runId, renewal.nodeId, COMMISSION_LEASE_DURATION_MS, RunState.enum.claimed]
+    );
+    if (!result.rows[0]) throw new CommissionTransitionError();
+    return CommissionLeaseRenewal.parse({ run: camel(result.rows[0]) });
+  }
+  async cancelCommission(input: CommissionCancellationInput) {
+    const cancellation = CommissionCancellationInput.parse(input);
+    const result = await this.pool.query(
+      `WITH cancelled_run AS (
+         UPDATE runs SET state=$2, lease_expires_at=NULL, updated_at=now()
+         WHERE id=$1 AND state <> ALL($3::run_state[])
+         RETURNING ${RUN_COLUMNS}
+       ), created_event AS (
+         INSERT INTO run_events(run_id,type,payload)
+         SELECT id,$4,jsonb_build_object('state',state,'reason',$5) FROM cancelled_run
+         RETURNING id,run_id,type,payload,occurred_at
+       )
+       SELECT row_to_json(cancelled_run) AS run,row_to_json(created_event) AS event
+       FROM cancelled_run CROSS JOIN created_event`,
+      [
+        cancellation.runId, RunState.enum.cancelled,
+        [RunState.enum.succeeded, RunState.enum.failed, RunState.enum.cancelled],
+        RunEventType.enum["commission.cancelled"], cancellation.reason
+      ]
+    );
+    if (!result.rows[0]) throw new CommissionTransitionError();
+    const row = result.rows[0] as { run: JsonRecord; event: JsonRecord };
+    return CommissionCancellation.parse({ run: camel(row.run), event: camel(row.event) });
+  }
+  async retryCommission(input: CommissionRetryInput) {
+    const retry = CommissionRetryInput.parse(input);
+    const result = await this.pool.query(
+      `WITH retried_run AS (
+         UPDATE runs SET state=$2, assigned_node_id=NULL, lease_expires_at=NULL, updated_at=now()
+         WHERE id=$1 AND state=$3 AND attempt < max_attempts
+         RETURNING ${RUN_COLUMNS}
+       ), created_event AS (
+         INSERT INTO run_events(run_id,type,payload)
+         SELECT id,$4,jsonb_build_object('state',state,'attempt',attempt,'maxAttempts',max_attempts)
+         FROM retried_run RETURNING id,run_id,type,payload,occurred_at
+       )
+       SELECT row_to_json(retried_run) AS run,row_to_json(created_event) AS event
+       FROM retried_run CROSS JOIN created_event`,
+      [retry.runId, RunState.enum.queued, RunState.enum.failed, RunEventType.enum["commission.retried"]]
+    );
+    if (!result.rows[0]) throw new CommissionTransitionError();
+    const row = result.rows[0] as { run: JsonRecord; event: JsonRecord };
+    return CommissionRetry.parse({ run: camel(row.run), event: camel(row.event) });
   }
   async completeCommission(input: CommissionCompletionInput) {
     const completion = CommissionCompletionInput.parse(input);
@@ -281,9 +408,9 @@ export class PgStore implements OrdisStore {
       : RunEventType.enum["commission.failed"];
     const result = await this.pool.query(
       `WITH completed_run AS (
-         UPDATE runs SET state=$3, updated_at=now()
-         WHERE id=$1 AND assigned_node_id=$2 AND state=$4
-         RETURNING id, project_id, command_id, state, assigned_node_id, payload, created_at, updated_at
+         UPDATE runs SET state=$3, lease_expires_at=NULL, updated_at=now()
+         WHERE id=$1 AND assigned_node_id=$2 AND state=$4 AND lease_expires_at>now()
+         RETURNING ${RUN_COLUMNS}
        ), created_event AS (
          INSERT INTO run_events(run_id,type,payload)
          SELECT completed_run.id, $5, jsonb_build_object('nodeId', $2, 'state', completed_run.state, 'exitCode', $6)
@@ -312,6 +439,7 @@ export class PgStore implements OrdisStore {
 export class MemoryStore implements OrdisStore {
   private runs: Run[] = [];
   private events: RunEvent[] = [];
+  private artifacts: Artifact[] = [];
   private nodes: NodeRecord[] = [];
   private projects: Project[] = [];
   private threads: Thread[] = [];
@@ -321,6 +449,7 @@ export class MemoryStore implements OrdisStore {
     if (table === "projects") return this.projects;
     if (table === "threads") return this.threads;
     if (table === "runs") return this.runs;
+    if (table === "artifacts") return this.artifacts;
     if (table === "nodes") return this.nodes;
     if (table === "reports") return this.reports;
     throw new Error(`MemoryStore does not implement list(${table})`);
@@ -332,6 +461,9 @@ export class MemoryStore implements OrdisStore {
       id: RunId.parse(randomUUID()),
       ...runInput,
       assignedNodeId: null,
+      leaseExpiresAt: null,
+      attempt: 0,
+      maxAttempts: 3,
       createdAt: now,
       updatedAt: now
     });
@@ -346,7 +478,7 @@ export class MemoryStore implements OrdisStore {
   }
   async appendCommissionOutput(input: CommissionOutputInput) {
     const output = CommissionOutputInput.parse(input);
-    if (!this.runs.some((run) => run.id === output.runId && run.assignedNodeId === output.nodeId && run.state === RunState.enum.claimed)) {
+    if (!this.runs.some((run) => run.id === output.runId && run.assignedNodeId === output.nodeId && run.state === RunState.enum.claimed && run.leaseExpiresAt && Date.parse(run.leaseExpiresAt) > Date.now())) {
       throw new CommissionTransitionError();
     }
     return this.appendEvent({
@@ -354,6 +486,24 @@ export class MemoryStore implements OrdisStore {
       type: RunEventType.enum["commission.output"],
       payload: { stdout: output.stdout, stderr: output.stderr, truncated: output.truncated }
     });
+  }
+  async createArtifact(input: ArtifactInput) {
+    const artifactInput = ArtifactInput.parse(input);
+    const run = this.runs.find((item) => item.id === artifactInput.runId && item.assignedNodeId === artifactInput.nodeId
+      && item.state === RunState.enum.claimed && item.leaseExpiresAt && Date.parse(item.leaseExpiresAt) > Date.now());
+    if (!run) throw new CommissionTransitionError();
+    const artifact = Artifact.parse({
+      id: ArtifactId.parse(randomUUID()), runId: artifactInput.runId, kind: artifactInput.kind, label: artifactInput.label,
+      mediaType: artifactInput.mediaType, body: artifactInput.body, sha256: artifactInput.sha256, createdAt: new Date().toISOString()
+    });
+    const event = await this.appendEvent({ runId: run.id, type: RunEventType.enum["commission.artifact"],
+      payload: { artifactId: artifact.id, kind: artifact.kind, label: artifact.label, sha256: artifact.sha256 } });
+    this.artifacts.unshift(artifact);
+    return ArtifactReceipt.parse({ artifact, event });
+  }
+  async listRunArtifacts(runId: Run["id"]) {
+    const id = RunId.parse(runId);
+    return this.artifacts.filter((artifact) => artifact.runId === id).slice().reverse();
   }
   async listRunEvents(runId: Run["id"]) {
     const id = RunId.parse(runId);
@@ -447,30 +597,84 @@ export class MemoryStore implements OrdisStore {
   }
   async claimCommission(nodeId: NodeHeartbeat["nodeId"]) {
     const handId = NodeId.parse(nodeId);
-    const runIndex = this.runs.findIndex((run) => run.assignedNodeId === handId && run.state === RunState.enum.queued);
+    const now = new Date().toISOString();
+    const expiredRuns = this.runs.filter((run) => run.state === RunState.enum.claimed && run.leaseExpiresAt
+      && Date.parse(run.leaseExpiresAt) <= Date.now());
+    for (const expired of expiredRuns) {
+      const recovered = Run.parse({
+        ...expired,
+        state: expired.attempt < expired.maxAttempts ? RunState.enum.queued : RunState.enum.failed,
+        assignedNodeId: null,
+        leaseExpiresAt: null,
+        updatedAt: now
+      });
+      this.runs[this.runs.indexOf(expired)] = recovered;
+      this.events.push(RunEvent.parse({
+        id: this.events.length + 1,
+        runId: recovered.id,
+        type: RunEventType.enum["commission.lease_expired"],
+        payload: { state: recovered.state, attempt: recovered.attempt, maxAttempts: recovered.maxAttempts },
+        occurredAt: now
+      }));
+    }
+    const runIndex = this.runs.findIndex((run) => (run.assignedNodeId === handId || run.assignedNodeId === null)
+      && run.state === RunState.enum.queued && run.attempt < run.maxAttempts);
     if (runIndex === -1) return null;
     const project = this.projects.find((candidate) => candidate.id === this.runs[runIndex].projectId);
     if (!project) throw new Error(`Project ${this.runs[runIndex].projectId} does not exist`);
-    const now = new Date().toISOString();
-    const run = Run.parse({ ...this.runs[runIndex], state: RunState.enum.claimed, updatedAt: now });
+    const run = Run.parse({ ...this.runs[runIndex], state: RunState.enum.claimed, assignedNodeId: handId,
+      attempt: this.runs[runIndex].attempt + 1,
+      leaseExpiresAt: new Date(Date.now() + COMMISSION_LEASE_DURATION_MS).toISOString(), updatedAt: now });
     const event = RunEvent.parse({
       id: this.events.length + 1,
       runId: run.id,
       type: RunEventType.enum["commission.claimed"],
-      payload: { nodeId: handId, state: run.state },
+      payload: { nodeId: handId, state: run.state, attempt: run.attempt, leaseExpiresAt: run.leaseExpiresAt },
       occurredAt: now
     });
     this.runs[runIndex] = run;
     this.events.push(event);
     return CommissionClaim.parse({ run, project, event });
   }
+  async renewCommissionLease(input: CommissionLeaseRenewalInput) {
+    const renewal = CommissionLeaseRenewalInput.parse(input);
+    const runIndex = this.runs.findIndex((run) => run.id === renewal.runId && run.assignedNodeId === renewal.nodeId
+      && run.state === RunState.enum.claimed && run.leaseExpiresAt && Date.parse(run.leaseExpiresAt) > Date.now());
+    if (runIndex === -1) throw new CommissionTransitionError();
+    const run = Run.parse({ ...this.runs[runIndex],
+      leaseExpiresAt: new Date(Date.now() + COMMISSION_LEASE_DURATION_MS).toISOString(), updatedAt: new Date().toISOString() });
+    this.runs[runIndex] = run;
+    return CommissionLeaseRenewal.parse({ run });
+  }
+  async cancelCommission(input: CommissionCancellationInput) {
+    const cancellation = CommissionCancellationInput.parse(input);
+    const runIndex = this.runs.findIndex((run) => run.id === cancellation.runId
+      && run.state !== RunState.enum.succeeded && run.state !== RunState.enum.failed && run.state !== RunState.enum.cancelled);
+    if (runIndex === -1) throw new CommissionTransitionError();
+    const run = Run.parse({ ...this.runs[runIndex], state: RunState.enum.cancelled, leaseExpiresAt: null, updatedAt: new Date().toISOString() });
+    const event = await this.appendEvent({ runId: run.id, type: RunEventType.enum["commission.cancelled"],
+      payload: { state: run.state, reason: cancellation.reason } });
+    this.runs[runIndex] = run;
+    return CommissionCancellation.parse({ run, event });
+  }
+  async retryCommission(input: CommissionRetryInput) {
+    const retry = CommissionRetryInput.parse(input);
+    const runIndex = this.runs.findIndex((run) => run.id === retry.runId && run.state === RunState.enum.failed && run.attempt < run.maxAttempts);
+    if (runIndex === -1) throw new CommissionTransitionError();
+    const run = Run.parse({ ...this.runs[runIndex], state: RunState.enum.queued, assignedNodeId: null, leaseExpiresAt: null, updatedAt: new Date().toISOString() });
+    const event = await this.appendEvent({ runId: run.id, type: RunEventType.enum["commission.retried"],
+      payload: { state: run.state, attempt: run.attempt, maxAttempts: run.maxAttempts } });
+    this.runs[runIndex] = run;
+    return CommissionRetry.parse({ run, event });
+  }
   async completeCommission(input: CommissionCompletionInput) {
     const completion = CommissionCompletionInput.parse(input);
     const runIndex = this.runs.findIndex((run) => run.id === completion.runId
-      && run.assignedNodeId === completion.nodeId && run.state === RunState.enum.claimed);
+      && run.assignedNodeId === completion.nodeId && run.state === RunState.enum.claimed
+      && run.leaseExpiresAt && Date.parse(run.leaseExpiresAt) > Date.now());
     if (runIndex === -1) throw new CommissionTransitionError();
     const now = new Date().toISOString();
-    const run = Run.parse({ ...this.runs[runIndex], state: completion.state, updatedAt: now });
+    const run = Run.parse({ ...this.runs[runIndex], state: completion.state, leaseExpiresAt: null, updatedAt: now });
     const event = RunEvent.parse({
       id: this.events.length + 1,
       runId: run.id,
